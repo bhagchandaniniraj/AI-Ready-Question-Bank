@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Marwadi University Question Bank — Auto Resume Updater
 // @namespace    MU-QuestionBank-Automation
-// @version      7.0.0
-// @description  Auto-updates existing questions without post-save verification, clicks success OK, closes Add New Question, resumes after refresh, and has a draggable compact panel.
+// @version      7.4.0
+// @description  Mark-aware question updater with three-attempt recovery for one-mark dropdown errors and automatic skip logging.
 // @match        https://academic.marwadiuniversity.ac.in:553/ManageQuestionBank.aspx*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -33,7 +33,25 @@
         saveButton: "ctl00_ContentPlaceHolder1_btnSave"
     };
 
-    const SUCCESS_TEXT = /record\s+update\s+successfully|record\s+updated\s+successfully|question\s+updated\s+successfully|update\s+successful|successfully\s+updated/i;
+    const SUCCESS_TEXT = /record\s+update\s+successfully|record\s+updated\s+successfully|question\s+updated\s+successfully|update\s+successful|successfully\s+updated|saved\s+successfully/i;
+
+    // Recovery is deliberately bounded. A failed question is retried from the
+    // beginning of that same question; completed question IDs are never replayed.
+    const RECOVERY = Object.freeze({
+        maxRetriesPerQuestion: 5,
+        // For the known drpQuestionMarks server error, a 1-mark MCQ gets
+        // three total opening attempts (initial attempt + two retries).
+        oneMarkDropdownMaxAttempts: 3,
+        oneMarkDropdownRetryDelaysMs: [5000, 10000],
+        oneMarkDropdownSkipRefreshDelayMs: 1500,
+        baseDelayMs: 5000,
+        maxDelayMs: 60000,
+        postbackTimeoutMs: 60000,
+        elementTimeoutMs: 45000,
+        openFormTimeoutMs: 60000,
+        successTimeoutMs: 90000,
+        popupCloseTimeoutMs: 20000
+    });
 
     const sleep = ms => new Promise(resolve => W.setTimeout(resolve, ms));
     const byId = id => D.getElementById(id);
@@ -41,6 +59,9 @@
     let ui = null;
     let localBusy = false;
     let successObserver = null;
+    let recoveryTimer = null;
+    let popupClickBusy = false;
+    let popupClickAttempts = 0;
 
     function readState() {
         try {
@@ -70,11 +91,323 @@
             state.status = message;
             writeState(state);
         }
+        updateSkipButton();
     }
 
     function setProgress(index, total) {
         if (ui?.bar) ui.bar.style.width = total ? (Math.round(index / total * 100) + "%") : "0%";
         if (ui?.count) ui.count.textContent = total ? (index + " / " + total) : "0 / 0";
+    }
+
+    function updateSkipButton() {
+        if (!ui?.skip) return;
+        const state = readState();
+        const diagnostic = [state?.status, state?.lastError, state?.lastPageAlert].filter(Boolean).join("\n");
+        const canSkip = !!state && !state.running && state.stage === "error" &&
+            !!state.currentQuestionId && Number.isInteger(Number(state.index)) &&
+            state.index >= 0 && isMarksDropdownMismatch(diagnostic);
+        ui.skip.hidden = !canSkip;
+        ui.skip.disabled = !canSkip;
+    }
+
+    function setPanelRunning(running) {
+        if (!ui) return;
+        ui.start.disabled = !!running;
+        ui.stop.disabled = !running;
+        if (ui.skip) ui.skip.disabled = !!running;
+        updateSkipButton();
+    }
+
+    function isMarksDropdownMismatch(message) {
+        const text = String(message || "");
+        return /drpQuestionMarks/i.test(text) &&
+            /SelectedValue/i.test(text) &&
+            /(does not exist in the list of items|invalid)/i.test(text);
+    }
+
+    function isPermanentFailure(message) {
+        const text = String(message || "");
+        return isMarksDropdownMismatch(text) || [
+            /question data is not stored/i,
+            /question data must be a non-empty array/i,
+            /question item \d+ is not an object/i,
+            /has no questionid/i,
+            /duplicate question id/i,
+            /has no question text/i,
+            /has no answer text/i,
+            /has no rubric rows/i,
+            /rubric row \d+ is incomplete or has invalid marks/i,
+            /validation message before update/i,
+            /validation|field is required|required field|invalid input|invalid marks|duplicate record/i,
+            /safety (?:check|stop).*failed/i,
+            /refusing to edit the wrong record/i,
+            /different existing question is already open/i,
+            /currently has \d+ rubric rows but the data file has/i,
+            /will not delete existing rubric rows/i,
+            /unknown automation stage/i,
+            /progress belongs to a different batch|question batch does not match|cannot safely match legacy progress/i,
+            /unauthorized|access denied|permission denied/i
+        ].some(pattern => pattern.test(text));
+    }
+
+    function addSkippedLogEntry(state, entry) {
+        if (!Array.isArray(state.skippedIds)) state.skippedIds = [];
+        if (!Array.isArray(state.skippedLog)) state.skippedLog = [];
+
+        const questionId = String(entry.questionId);
+        if (!state.skippedIds.includes(questionId)) state.skippedIds.push(questionId);
+
+        // Keep one canonical log entry per skipped question ID.
+        const existing = state.skippedLog.findIndex(row => String(row.questionId) === questionId);
+        const normalized = {
+            questionId,
+            marks: entry.marks == null ? null : Number(entry.marks),
+            reason: String(entry.reason || "Skipped"),
+            attempts: Number(entry.attempts || 0),
+            error: String(entry.error || ""),
+            skippedAt: entry.skippedAt || new Date().toISOString()
+        };
+        if (existing >= 0) state.skippedLog[existing] = normalized;
+        else state.skippedLog.push(normalized);
+    }
+
+    function reloadForResume(delayMs, questionId, statusMessage) {
+        if (recoveryTimer) W.clearTimeout(recoveryTimer);
+        recoveryTimer = W.setTimeout(() => {
+            const latest = readState();
+            if (!latest?.running || !latest.recoveryPending) return;
+            latest.status = statusMessage || ("Refreshing the page and resuming Question ID " +
+                (latest.currentQuestionId || questionId || "the next question") + "...");
+            writeState(latest);
+            try {
+                W.location.reload();
+            } catch (reloadError) {
+                latest.running = false;
+                latest.stage = "error";
+                latest.recoveryPending = false;
+                latest.lastError = String(reloadError?.stack || reloadError);
+                latest.status = "ERROR: Automatic page refresh failed. " +
+                    (reloadError?.message || reloadError);
+                writeState(latest);
+                setStatus(latest.status);
+                setPanelRunning(false);
+            }
+        }, delayMs);
+    }
+
+    function scheduleRecovery(error) {
+        const state = readState();
+        if (!state || !state.running) return false;
+        if (state.recoveryPending) return true;
+
+        let batch = [];
+        try { batch = readBatch(); } catch (_) {}
+        const item = batch[state.index];
+        const questionId = String(state.currentQuestionId || item?.questionId || "").trim();
+        if (questionId) state.currentQuestionId = questionId;
+
+        const shortError = String(error?.message || error || "Unknown automation error");
+        const detail = String(error?.stack || shortError);
+        const combinedError = shortError + " " + String(state.lastPageAlert || "");
+        const resumeStage = state.stage === "advance" ? "advance" : "prepare";
+        const retryKey = questionId || ("index:" + state.index);
+        const processed = Array.isArray(state.completedIds) ? state.completedIds.length : 0;
+
+        // Special handling for the known ASP.NET marks-dropdown exception.
+        // A 1-mark question is a valid MCQ: retry opening it three total times,
+        // then record it as skipped and continue. Other mark values still pause
+        // for manual/administrator review without being silently skipped.
+        if (isMarksDropdownMismatch(combinedError)) {
+            const blockedItem = batch.find(row => String(row.questionId) === questionId) || item;
+            const markValue = blockedItem?.marks;
+
+            if (Number(markValue) === 1) {
+                if (state.retryQuestionId !== retryKey) {
+                    state.retryQuestionId = retryKey;
+                    state.retryCount = 0;
+                }
+
+                const attempt = Number(state.retryCount || 0) + 1;
+                state.retryCount = attempt;
+                state.lastError = detail;
+                state.lastPageAlert = null;
+                state.stage = "prepare";
+                state.resumeStage = "prepare";
+                state.successPopupHandled = false;
+                state.recoveryPending = true;
+
+                if (attempt < RECOVERY.oneMarkDropdownMaxAttempts) {
+                    const delay = RECOVERY.oneMarkDropdownRetryDelaysMs[
+                        Math.min(attempt - 1, RECOVERY.oneMarkDropdownRetryDelaysMs.length - 1)
+                    ];
+                    state.status = "ONE-MARK MCQ RETRY: Question ID " + questionId +
+                        " encountered the drpQuestionMarks server error. Attempt " + attempt + "/" +
+                        RECOVERY.oneMarkDropdownMaxAttempts + " failed; refreshing before the next attempt." +
+                        "\nMarks: 1 (valid MCQ)." +
+                        "\nSuccessfully updated: " + processed + " | Skipped: " +
+                        ((state.skippedIds || []).length) +
+                        "\nRetrying in " + Math.ceil(delay / 1000) + " seconds...";
+                    writeState(state);
+                    setStatus(state.status);
+                    setProgress(state.index || 0, batch.length || 0);
+                    setPanelRunning(true);
+                    reloadForResume(delay, questionId,
+                        "Refreshing before attempt " + (attempt + 1) + "/" +
+                        RECOVERY.oneMarkDropdownMaxAttempts + " for Question ID " + questionId + "...");
+                    console.warn("[MU QB] One-mark dropdown retry scheduled:", {
+                        questionId, attempt, maxAttempts: RECOVERY.oneMarkDropdownMaxAttempts, delay
+                    });
+                    return true;
+                }
+
+                // Third failed attempt: record a skip and move the saved cursor
+                // forward before refreshing. This prevents re-opening the failed ID.
+                addSkippedLogEntry(state, {
+                    questionId,
+                    marks: 1,
+                    reason: "drpQuestionMarks SelectedValue missing from dropdown after 3 attempts",
+                    attempts: attempt,
+                    error: shortError
+                });
+                state.index += 1;
+                state.currentQuestionId = null;
+                state.retryQuestionId = null;
+                state.retryCount = 0;
+                state.running = true;
+                state.stage = "prepare";
+                state.resumeStage = "prepare";
+                state.recoveryPending = true;
+                state.successPopupHandled = false;
+                state.successPopupAttempts = 0;
+                state.lastPageAlert = null;
+                state.resumeNotice = "Question ID " + questionId +
+                    " was skipped after " + attempt + " failed attempts because the portal's drpQuestionMarks dropdown rejected the valid 1-mark value. Continuing with the next question.";
+                state.status = "AUTO-SKIPPED: Question ID " + questionId +
+                    " was NOT updated after " + attempt + " failed attempts (1-mark dropdown error)." +
+                    "\nRefreshing and continuing with the next question..." +
+                    "\nSuccessfully updated: " + processed + " | Skipped: " + state.skippedIds.length;
+                writeState(state);
+                setStatus(state.status);
+                setProgress(state.index, batch.length);
+                setPanelRunning(true);
+                reloadForResume(RECOVERY.oneMarkDropdownSkipRefreshDelayMs, questionId,
+                    "Question ID " + questionId + " was logged as skipped. Refreshing and continuing with the next question...");
+                console.error("[MU QB] Automatically skipped one-mark question after three failed attempts:", {
+                    questionId, marks: 1, attempts: attempt, error: shortError
+                });
+                return true;
+            }
+        }
+
+        if (isPermanentFailure(combinedError)) {
+            state.running = false;
+            state.stage = "error";
+            state.resumeStage = resumeStage;
+            state.recoveryPending = false;
+            state.lastError = detail;
+            if (isMarksDropdownMismatch(combinedError)) {
+                const blockedItem = batch.find(item => item.questionId === questionId);
+                const markValue = blockedItem?.marks;
+                const marksHint = markValue === 1
+                    ? " The data file correctly specifies 1 mark. A one-mark MCQ is valid; do not increase its marks to bypass this error. The portal dropdown must contain the exact underlying value 1 before the server assigns SelectedValue."
+                    : Number.isFinite(markValue)
+                        ? " The data file specifies " + markValue + " mark(s). Confirm that this exact underlying value is present in the portal dropdown before the server assigns SelectedValue."
+                        : " Confirm that the stored mark value is present in the portal dropdown before the server assigns SelectedValue.";
+                state.status = "PORTAL CONFIGURATION ERROR: Question ID " + (questionId || "unknown") +
+                    " is present in the grid, but the server cannot open its edit form because drpQuestionMarks has a SelectedValue that is missing from its dropdown items." +
+                    "\nThis is not a missing Question ID or a slow-server timeout." + marksHint +
+                    "\nNo automatic refresh/retry was attempted because repeating this request will not repair the server-side dropdown. Ask the portal administrator to bind the Marks list before assigning SelectedValue." +
+                    "\nProgress is preserved. Press Start / Resume after the portal-side correction. Alternatively, use Skip this ID and continue only if you intentionally want to leave this question unchanged." +
+                    "\nSuccessfully updated: " + processed + " | Skipped: " + ((state.skippedIds || []).length);
+            } else {
+                state.status = "ERROR: " + shortError +
+                    "\nID: " + (questionId || "not set") +
+                    " | Processed: " + processed +
+                    "\nAutomatic retry was not attempted because this appears to be a data, validation, permission, or safety issue. Correct it and press Start / Resume.";
+            }
+            writeState(state);
+            setStatus(state.status);
+            setPanelRunning(false);
+            console.error("[MU QB] Manual intervention required:", error);
+            return true;
+        }
+
+        if (state.retryQuestionId !== retryKey) {
+            state.retryQuestionId = retryKey;
+            state.retryCount = 0;
+        }
+
+        const nextAttempt = Number(state.retryCount || 0) + 1;
+        if (nextAttempt > RECOVERY.maxRetriesPerQuestion) {
+            state.running = false;
+            state.stage = "error";
+            state.resumeStage = resumeStage;
+            state.recoveryPending = false;
+            state.lastError = detail;
+            state.status = "ERROR: Automatic recovery limit reached for Question ID " +
+                (questionId || "unknown") + "." +
+                "\nLast issue: " + shortError +
+                "\nProcessed: " + processed +
+                "\nThe batch is safely paused. Press Start / Resume to try this same question again.";
+            writeState(state);
+            setStatus(state.status);
+            setPanelRunning(false);
+            console.error("[MU QB] Automatic retry limit reached:", error);
+            return true;
+        }
+
+        state.retryCount = nextAttempt;
+        state.stage = resumeStage;
+        state.resumeStage = resumeStage;
+        state.successPopupHandled = resumeStage === "advance"
+            ? !!state.successPopupHandled : false;
+        state.recoveryPending = true;
+        state.lastError = detail;
+        state.lastPageAlert = null;
+
+        const delay = Math.min(
+            RECOVERY.baseDelayMs * Math.pow(2, nextAttempt - 1),
+            RECOVERY.maxDelayMs
+        );
+        state.status = "TEMPORARY ISSUE: " + shortError +
+            "\nQuestion ID: " + (questionId || "not set") +
+            " | Processed: " + processed +
+            "\nAutomatic recovery " + nextAttempt + "/" + RECOVERY.maxRetriesPerQuestion +
+            ". Refreshing and resuming this same question in " +
+            Math.ceil(delay / 1000) + " seconds...";
+        writeState(state);
+        setStatus(state.status);
+        setProgress(state.index || 0, batch.length || 0);
+        setPanelRunning(true);
+
+        if (recoveryTimer) W.clearTimeout(recoveryTimer);
+        recoveryTimer = W.setTimeout(() => {
+            const latest = readState();
+            if (!latest?.running || !latest.recoveryPending ||
+                Number(latest.retryCount) !== nextAttempt) return;
+
+            latest.status = "Refreshing the page and resuming Question ID " +
+                (latest.currentQuestionId || questionId || "unknown") + "...";
+            writeState(latest);
+            try {
+                W.location.reload();
+            } catch (reloadError) {
+                latest.running = false;
+                latest.stage = "error";
+                latest.recoveryPending = false;
+                latest.lastError = String(reloadError?.stack || reloadError);
+                latest.status = "ERROR: Automatic page refresh failed. " +
+                    (reloadError?.message || reloadError);
+                writeState(latest);
+                setStatus(latest.status);
+                setPanelRunning(false);
+            }
+        }, delay);
+
+        console.warn("[MU QB] Automatic recovery scheduled:", {
+            questionId, attempt: nextAttempt, delay, error: shortError
+        });
+        return true;
     }
 
     function readBatch() {
@@ -125,21 +458,98 @@
                 }
             });
 
+            const normalizedRubric = rubric.map(row => ({
+                criterion: String(row.criterion),
+                expectedEvidence: String(row.expectedEvidence),
+                marks: Number(row.marks)
+            }));
+
+            // Question-level marks are metadata from the data file. A value of 1
+            // is valid (for example, a one-mark MCQ) and is not a reason to reject
+            // the record. This script does not force the portal's server dropdown.
+            const marks = item.marks == null || item.marks === "" ? null : Number(item.marks);
+            if (marks !== null && (!Number.isInteger(marks) || marks < 1)) {
+                throw new Error("Question ID " + questionId + " has invalid question-level marks: " + item.marks + ". Marks must be a positive whole number.");
+            }
+            if (marks !== null) {
+                const rubricTotal = normalizedRubric.reduce((sum, row) => sum + row.marks, 0);
+                if (Math.abs(rubricTotal - marks) > 0.000001) {
+                    throw new Error("Question ID " + questionId + " has question marks " + marks +
+                        " but its rubric totals " + rubricTotal + ". Correct the data before running the batch.");
+                }
+            }
+
             return {
                 questionId,
                 question,
                 answer,
-                rubric: rubric.map(row => ({
-                    criterion: String(row.criterion),
-                    expectedEvidence: String(row.expectedEvidence),
-                    marks: Number(row.marks)
-                }))
+                rubric: normalizedRubric,
+                marks
             };
         });
     }
 
-    // Intercept only the university's success alert(), if it uses one.
-    // Other alerts are never suppressed.
+    function getBatchSignature(batch) {
+        // Keep the Version 7.2 signature shape for backward compatibility with
+        // saved progress. Question-level marks are validated separately and are
+        // not changed by this updater; the editable payload remains these fields.
+        const signaturePayload = batch.map(item => ({
+            questionId: item.questionId,
+            question: item.question,
+            answer: item.answer,
+            rubric: item.rubric
+        }));
+        const serialized = JSON.stringify(signaturePayload);
+        let hash = 2166136261;
+        for (let index = 0; index < serialized.length; index++) {
+            hash ^= serialized.charCodeAt(index);
+            hash = Math.imul(hash, 16777619);
+        }
+        return batch.length + ":" + (hash >>> 0).toString(16);
+    }
+
+    function assertBatchMatchesState(state, batch) {
+        const signature = getBatchSignature(batch);
+        const validIds = new Set(batch.map(item => String(item.questionId)));
+        const completed = Array.isArray(state.completedIds)
+            ? state.completedIds.map(String) : [];
+        const skipped = Array.isArray(state.skippedIds)
+            ? state.skippedIds.map(String) : [];
+        const processed = [...completed, ...skipped];
+        const processedSet = new Set(processed);
+        const index = Number(state.index || 0);
+
+        if (!Number.isInteger(index) || index < 0 || index > batch.length) {
+            throw new Error("Stored progress belongs to a different batch or has an invalid question index. Load the correct question-data file or press Reset for a new batch.");
+        }
+
+        if (state.batchSignature && state.batchSignature !== signature) {
+            throw new Error("The loaded question-data file does not match the saved progress. Restore the original batch to resume, or press Reset to start this batch from the beginning.");
+        }
+
+        if (processed.some(id => !validIds.has(id)) ||
+            (state.currentQuestionId && !validIds.has(String(state.currentQuestionId)))) {
+            throw new Error("Stored progress belongs to a different batch. The saved question IDs are not present in the loaded data file. Restore the correct data file or press Reset for a new batch.");
+        }
+
+        if (processedSet.size !== processed.length || processed.length !== index ||
+            batch.slice(0, index).some(item => !processedSet.has(item.questionId)) ||
+            batch.slice(index).some(item => processedSet.has(item.questionId))) {
+            throw new Error("Saved progress does not match the completed/skipped question sequence. The batch has been paused to prevent a question from being repeated or silently omitted. Restore the matching data file or press Reset for a new batch.");
+        }
+
+        if (!Array.isArray(state.skippedIds)) state.skippedIds = [];
+
+        if (!state.batchSignature) {
+            state.batchSignature = signature;
+            writeState(state);
+        }
+    }
+
+    // Handle native alerts. Known success alerts are consumed automatically.
+    // Transient alerts are suppressed and trigger refresh/recovery so a blocked
+    // native dialog cannot leave the batch waiting indefinitely. Validation,
+    // permission and safety alerts remain visible and pause for manual review.
     try {
         const originalAlert = W.alert.bind(W);
         Object.defineProperty(W, "alert", {
@@ -154,19 +564,43 @@
                     state.successPopupHandled = true;
                     state.status = "Success received for Question ID " +
                         (state.currentQuestionId || "") + ".";
+                    state.lastPageAlert = null;
                     writeState(state);
                     console.info("[MU QB] Suppressed success alert:", text);
                     return;
                 }
 
-                if (state?.running && state.stage === "saving") {
-                    state.running = false;
-                    state.stage = "error";
-                    state.resumeStage = "saving";
-                    state.lastError = text || "Unexpected alert during save.";
-                    state.status = "Batch paused: " + state.lastError;
+                if (state?.running) {
+                    const previousStage = state.stage;
+                    state.lastPageAlert = text || "Unexpected page alert.";
+
+                    if (isMarksDropdownMismatch(text)) {
+                        writeState(state);
+                        scheduleRecovery(new Error("Page alert: " + (text || "Marks dropdown configuration error.")));
+                        return;
+                    }
+
+                    if (isPermanentFailure(text)) {
+                        state.running = false;
+                        state.stage = "error";
+                        state.resumeStage = previousStage === "advance" ? "advance" : "prepare";
+                        state.lastError = "Page alert: " + state.lastPageAlert;
+                        state.status = "ERROR: Page validation/safety alert: " +
+                            state.lastPageAlert + "\nQuestion ID: " +
+                            (state.currentQuestionId || "not set") +
+                            " | Processed: " +
+                            ((state.completedIds || []).length) +
+                            "\nCorrect the issue, then press Start / Resume.";
+                        writeState(state);
+                        setPanelRunning(false);
+                        return originalAlert(message);
+                    }
+
                     writeState(state);
+                    scheduleRecovery(new Error("Page alert: " + (text || "Unexpected page alert.")));
+                    return;
                 }
+
                 return originalAlert(message);
             }
         });
@@ -194,7 +628,7 @@
         for (const button of buttonNodes) {
             if (!isVisible(button) || button.disabled) continue;
             const label = String(
-                button.innerText || button.textContent || button.value || ""
+                button.innerText || button.textContent || button.value || button.getAttribute("aria-label") || button.title || ""
             ).replace(/\s+/g, " ").trim();
             if (!/^(ok|okay|confirm|yes)$/i.test(label)) continue;
 
@@ -208,7 +642,7 @@
         }
 
         const candidates = D.querySelectorAll(
-            ".sweet-alert, .swal-modal, .swal2-popup, [role='dialog'], .modal"
+            ".sweet-alert, .swal-modal, .swal2-popup, .swal2-container, .swal-overlay, [role='dialog'], .modal"
         );
         for (const popup of candidates) {
             if (!isVisible(popup)) continue;
@@ -218,7 +652,7 @@
             const ok = Array.from(popup.querySelectorAll(
                 "button, input[type='button'], input[type='submit']"
             )).find(button => {
-                const label = String(button.innerText || button.textContent || button.value || "")
+                const label = String(button.innerText || button.textContent || button.value || button.getAttribute("aria-label") || button.title || "")
                     .replace(/\s+/g, " ").trim();
                 return /^(ok|okay|confirm|yes)$/i.test(label) && !button.disabled;
             });
@@ -228,28 +662,50 @@
     }
     function handleSuccessPopup() {
         const state = readState();
-        if (!state?.running || state.stage !== "saving" || state.successPopupHandled) return;
+        if (!state?.running || !["saving", "advance"].includes(state.stage)) return;
+        if (popupClickBusy) return;
 
         const found = getSuccessPopup();
         if (!found) return;
 
-        // Save the next state BEFORE clicking OK. If OK causes a page refresh,
-        // the next document will continue at the advance stage without re-opening the record.
-        state.stage = "advance";
-        state.successPopupHandled = true;
-        state.status = "Success popup detected. Automatically clicking OK for Question ID " +
-            (state.currentQuestionId || "") + "...";
+        if (state.stage === "saving") {
+            state.stage = "advance";
+            state.successPopupHandled = true;
+            state.status = "Success popup detected. Automatically clicking OK for Question ID " +
+                (state.currentQuestionId || "") + "...";
+        }
+
+        popupClickAttempts += 1;
+        state.successPopupAttempts = popupClickAttempts;
         writeState(state);
-        setStatus(state.status);
+        setStatus(state.status || "Automatically closing the success confirmation...");
+        popupClickBusy = true;
 
         W.setTimeout(() => {
             try {
-                if (found.button && found.button.isConnected && isVisible(found.button)) {
+                if (found.button && found.button.isConnected && isVisible(found.button) &&
+                    !found.button.disabled) {
                     found.button.click();
                 }
             } catch (error) {
                 console.error("[MU QB] Could not auto-click success OK:", error);
             }
+
+            W.setTimeout(() => {
+                popupClickBusy = false;
+                const latest = readState();
+                if (!getSuccessPopup()) return;
+
+                if (latest?.running && latest.stage === "advance") {
+                    if (popupClickAttempts >= 5) {
+                        scheduleRecovery(new Error(
+                            "The success confirmation popup did not close after 5 automatic OK-click attempts."
+                        ));
+                    } else {
+                        handleSuccessPopup();
+                    }
+                }
+            }, 1200);
         }, 350);
     }
 
@@ -266,7 +722,7 @@
         handleSuccessPopup();
     }
 
-    function waitFor(getter, label, timeout = 20000) {
+    function waitFor(getter, label, timeout = RECOVERY.elementTimeoutMs) {
         return new Promise((resolve, reject) => {
             const started = Date.now();
             const poll = () => {
@@ -281,7 +737,7 @@
                 if (Date.now() - started > timeout) {
                     return reject(new Error("Timed out waiting for " + label + "."));
                 }
-                W.setTimeout(poll, 150);
+                W.setTimeout(poll, 250);
             };
             poll();
         });
@@ -400,7 +856,7 @@
         await waitFor(() => {
             const info = getPagerInfo();
             return info && info.current === pageIndex;
-        }, "Question Bank grid page " + (pageIndex + 1), 25000);
+        }, "Question Bank grid page " + (pageIndex + 1), RECOVERY.openFormTimeoutMs);
         await sleep(250);
     }
 
@@ -446,7 +902,7 @@
         }
 
         return waitFor(() => !modalIsVisible(),
-            "Add Question form to close", 12000).then(() => {
+            "Add Question form to close", RECOVERY.popupCloseTimeoutMs).then(() => {
                 try { if (typeof W.HideModal === "function") W.HideModal(); } catch (_) {}
             });
     }
@@ -483,12 +939,12 @@
 
         try {
             await waitFor(() => !modalIsVisible(),
-                "blank Add New Question form to close using Cancel", 9000);
+                "blank Add New Question form to close using Cancel", 15000);
         } catch (firstError) {
             if (W.jQuery && W.jQuery.fn && typeof W.jQuery.fn.modal === "function") {
                 W.jQuery(modal).modal("hide");
                 await waitFor(() => !modalIsVisible(),
-                    "blank Add New Question form to close", 9000);
+                    "blank Add New Question form to close", 15000);
             } else {
                 throw new Error(
                     "Could not close the blank Add New Question form. Cancel click did not hide it. " +
@@ -499,7 +955,7 @@
         await sleep(250);
     }
 
-    function runPartialPostback(action, label, timeout = 25000) {
+    function runPartialPostback(action, label, timeout = RECOVERY.postbackTimeoutMs) {
         const prm = W.Sys?.WebForms?.PageRequestManager?.getInstance?.();
         if (!prm) {
             action();
@@ -520,7 +976,10 @@
                 finished = true;
                 cleanup();
                 const error = args?.get_error?.();
-                if (error) reject(new Error(label + " failed: " + (error.message || error)));
+                if (error) {
+                    try { args?.set_errorHandled?.(true); } catch (_) {}
+                    reject(new Error(label + " failed: " + (error.message || error)));
+                }
                 else resolve();
             };
 
@@ -529,7 +988,7 @@
                 if (finished) return;
                 finished = true;
                 cleanup();
-                reject(new Error(label + " did not finish. Check the university page."));
+                reject(new Error(label + " did not finish after " + Math.round(timeout / 1000) + " seconds. The server/page may be busy or unresponsive."));
             }, timeout);
 
             try {
@@ -569,7 +1028,7 @@
         await waitFor(
             () => modalIsVisible() && currentFormQuestionId() === questionId,
             "Edit form for Question ID " + questionId,
-            25000
+            RECOVERY.openFormTimeoutMs
         );
 
         if (currentFormQuestionId() !== questionId) {
@@ -641,19 +1100,38 @@
         const editor = await waitFor(
             () => W.CKEDITOR?.instances?.[editorId],
             label + " CKEditor",
-            18000
+            30000
         );
 
         await new Promise((resolve, reject) => {
+            let finished = false;
+            const timer = W.setTimeout(() => {
+                if (finished) return;
+                finished = true;
+                reject(new Error(label + " CKEditor did not finish setting content within 45 seconds."));
+            }, 45000);
+
+            const finish = error => {
+                if (finished) return;
+                finished = true;
+                W.clearTimeout(timer);
+                if (error) reject(error);
+                else resolve();
+            };
+
             try {
                 editor.setData(String(html), {
                     callback: function () {
-                        editor.updateElement();
-                        resolve();
+                        try {
+                            editor.updateElement();
+                            finish();
+                        } catch (error) {
+                            finish(error);
+                        }
                     }
                 });
             } catch (error) {
-                reject(error);
+                finish(error);
             }
         });
     }
@@ -680,7 +1158,7 @@
         await waitFor(() => {
             const state = readState();
             return state && state.stage === "advance" && state.successPopupHandled === true;
-        }, "success popup and automatic OK click for Question ID " + questionId, 60000);
+        }, "success popup and automatic OK click for Question ID " + questionId, RECOVERY.successTimeoutMs);
     }
 
     async function clickUpdateAndWait(item, index, total) {
@@ -721,7 +1199,7 @@
         // blank Add New Question form. No post-save record/editor verification
         // is performed; the success confirmation advances the batch.
         await waitFor(() => !getSuccessPopup(),
-            "success popup to close after automatic OK click", 12000);
+            "success popup to close after automatic OK click", RECOVERY.popupCloseTimeoutMs);
         await closeBlankAddQuestionFormIfNeeded();
 
         const state = readState();
@@ -735,6 +1213,13 @@
         state.index += 1;
         state.currentQuestionId = null;
         state.successPopupHandled = false;
+        state.successPopupAttempts = 0;
+        popupClickAttempts = 0;
+        popupClickBusy = false;
+        state.retryQuestionId = null;
+        state.retryCount = 0;
+        state.recoveryPending = false;
+        state.lastPageAlert = null;
         state.stage = "prepare";
         state.status = "Success confirmation received: " + state.completedIds.length +
             "/" + total + " processed. Last ID: " + item.questionId + ".";
@@ -750,6 +1235,8 @@
 
         try {
             const batch = readBatch();
+            const startingState = readState();
+            if (startingState?.running) assertBatchMatchesState(startingState, batch);
 
             while (true) {
                 const state = readState();
@@ -759,15 +1246,38 @@
                     state.running = false;
                     state.stage = "done";
                     state.currentQuestionId = null;
-                    state.status = "Completed all " + batch.length +
-                        " update(s). Success confirmations received. IDs: " + (state.completedIds || []).join(", ");
+                    const updatedCount = (state.completedIds || []).length;
+                    const skippedCount = (state.skippedIds || []).length;
+                    if (!Array.isArray(state.skippedLog)) state.skippedLog = [];
+                    const skippedReport = state.skippedLog.map(row =>
+                        row.questionId + " (" + row.reason + "; attempts: " + row.attempts + ")"
+                    );
+                    state.status = "BATCH FINISHED" +
+                        "\nSuccessfully updated: " + updatedCount +
+                        "\nSkipped (NOT modified): " + skippedCount +
+                        "\nUpdated IDs: " + (state.completedIds || []).join(", ") +
+                        "\nSkipped IDs: " + (state.skippedIds || []).join(", ") +
+                        (skippedReport.length ? "\nSKIPPED-QUESTION LOG:\n" + skippedReport.join("\n") : "\nNo skipped questions.");
                     writeState(state);
                     setProgress(batch.length, batch.length);
                     setStatus(state.status);
+                    console.groupCollapsed("[MU QB] Final batch report");
+                    console.log("Successfully updated:", updatedCount, "| Skipped:", skippedCount, "| Total:", batch.length);
+                    console.log("Updated IDs:", state.completedIds || []);
+                    console.table(state.skippedLog);
+                    console.groupEnd();
                     break;
                 }
 
                 const item = batch[state.index];
+                if (!state.currentQuestionId || String(state.currentQuestionId) !== item.questionId) {
+                    state.currentQuestionId = item.questionId;
+                    if (state.retryQuestionId !== item.questionId) {
+                        state.retryQuestionId = item.questionId;
+                        state.retryCount = 0;
+                    }
+                    writeState(state);
+                }
                 setProgress(state.index, batch.length);
 
                 if (state.stage === "saving") {
@@ -818,25 +1328,31 @@
                 // fully reloads, localStorage carries stage="advance" into the new document.
             }
         } catch (error) {
-            console.error("[MU QB] Auto updater stopped:", error);
+            console.error("[MU QB] Auto updater encountered an error:", error);
             const state = readState() || {};
-            const resumeStage = (state.stage === "saving" || state.stage === "advance")
-                ? state.stage : "prepare";
-            state.running = false;
-            state.stage = "error";
-            state.resumeStage = resumeStage;
-            state.lastError = error?.stack || error?.message || String(error);
-            state.status = "ERROR: " + (error?.message || String(error)) +
-                "\\nID: " + (state.currentQuestionId || "not set") +
-                " | Processed: " + ((state.completedIds || []).length);
-            writeState(state);
-            setStatus(state.status);
+
+            if (state.running && scheduleRecovery(error)) {
+                // scheduleRecovery persisted the current question and will reload
+                // the page. The same question is retried; completed IDs are kept.
+            } else if (!state.running) {
+                // A deliberate user stop must remain a stop, not become an error.
+                if (state.status !== "Stopped by user.") {
+                    state.status = state.status || "Paused.";
+                    writeState(state);
+                    setStatus(state.status);
+                }
+            } else {
+                state.running = false;
+                state.stage = "error";
+                state.lastError = error?.stack || error?.message || String(error);
+                state.status = "ERROR: " + (error?.message || String(error));
+                writeState(state);
+                setStatus(state.status);
+            }
         } finally {
             localBusy = false;
-            if (ui) {
-                ui.start.disabled = false;
-                ui.stop.disabled = true;
-            }
+            const latest = readState();
+            setPanelRunning(!!latest?.running);
         }
     }
 
@@ -870,8 +1386,9 @@
             #stop{background:#fee2e2;color:#991b1b}
             #reset{background:#e2e8f0;color:#334155}
             #copyError{background:#9f1239;color:#fff}
+            #skip{background:#fef3c7;color:#92400e;border:1px solid #f59e0b}
             button:disabled{opacity:.45;cursor:not-allowed}
-            #copyError[hidden]{display:none}
+            #copyError[hidden],#skip[hidden]{display:none}
             .collapsed .body{display:none}
           </style>
           <div class="panel" id="panel">
@@ -887,6 +1404,7 @@
                 <button id="start">Start / Resume</button>
                 <button id="stop" disabled>Stop</button>
                 <button id="reset">Reset</button>
+                <button id="skip" hidden>Skip this ID and continue</button>
                 <button id="copyError" hidden>Copy error</button>
               </div>
             </div>
@@ -915,6 +1433,7 @@
             stop: get("stop"),
             reset: get("reset"),
             copyError: get("copyError"),
+            skip: get("skip"),
             status: get("status"),
             bar: get("bar"),
             count: get("count"),
@@ -991,6 +1510,68 @@
             } catch (_) {}
         });
 
+        ui.skip.addEventListener("click", async () => {
+            try {
+                const batch = readBatch();
+                const state = readState();
+                if (!state || state.running || state.stage !== "error" ||
+                    !isMarksDropdownMismatch([state.status, state.lastError, state.lastPageAlert].filter(Boolean).join("\n"))) {
+                    throw new Error("Skip is available only when the batch is paused on the detected drpQuestionMarks SelectedValue configuration error.");
+                }
+
+                assertBatchMatchesState(state, batch);
+                const item = batch[state.index];
+                if (!item || String(state.currentQuestionId || item.questionId) !== item.questionId) {
+                    throw new Error("The current question ID does not match the saved batch position. Nothing was skipped.");
+                }
+
+                if (modalIsVisible()) {
+                    if (isBlankAddQuestionForm()) {
+                        await closeBlankAddQuestionFormIfNeeded();
+                    } else {
+                        throw new Error("An edit form is still open. Close it manually before skipping this question.");
+                    }
+                }
+
+                const markText = item.marks == null ? "" : "\nQuestion marks: " + item.marks;
+                const confirmed = W.confirm(
+                    "Skip Question ID " + item.questionId + "?" + markText +
+                    "\n\nThis question will NOT be updated and will be recorded separately as skipped. The batch will continue with the next ID."
+                );
+                if (!confirmed) return;
+
+                addSkippedLogEntry(state, {
+                    questionId: item.questionId,
+                    marks: item.marks,
+                    reason: "Manually skipped by user",
+                    attempts: Number(state.retryCount || 0),
+                    error: String(state.lastError || state.status || "")
+                });
+                state.index += 1;
+                state.currentQuestionId = null;
+                state.running = true;
+                state.stage = "prepare";
+                state.resumeStage = "prepare";
+                state.retryQuestionId = null;
+                state.retryCount = 0;
+                state.recoveryPending = false;
+                state.lastPageAlert = null;
+                state.lastError = null;
+                state.successPopupHandled = false;
+                state.successPopupAttempts = 0;
+                state.status = "Skipped Question ID " + item.questionId + " (NOT updated). Continuing with the next question. Successfully updated: " +
+                    (state.completedIds || []).length + " | Skipped: " + state.skippedIds.length + ".";
+                writeState(state);
+                setPanelRunning(true);
+                ui.copyError.hidden = true;
+                setProgress(state.index, batch.length);
+                setStatus(state.status);
+                runEngine();
+            } catch (error) {
+                setStatus("ERROR: " + (error?.message || error));
+            }
+        });
+
         ui.copyError.addEventListener("click", async () => {
             const state = readState() || {};
             const details = [
@@ -1020,27 +1601,42 @@
         ui.start.addEventListener("click", () => {
             try {
                 const batch = readBatch();
+                const batchSignature = getBatchSignature(batch);
                 let state = readState();
 
-                if (!state || state.stage === "done" || state.index >= batch.length) {
+                if (!state || state.stage === "done") {
                     state = {
                         running: true,
                         index: 0,
                         stage: "prepare",
                         completedIds: [],
+                        skippedIds: [],
+                        skippedLog: [],
                         currentQuestionId: null,
                         successPopupHandled: false,
+                        successPopupAttempts: 0,
+                        retryQuestionId: null,
+                        retryCount: 0,
+                        recoveryPending: false,
+                        batchSignature,
+                        lastPageAlert: null,
                         lastError: null
                     };
                 } else {
+                    assertBatchMatchesState(state, batch);
+                    if (!Array.isArray(state.skippedIds)) state.skippedIds = [];
+                    if (!Array.isArray(state.skippedLog)) state.skippedLog = [];
                     state.running = true;
                     if (state.stage === "error") state.stage = state.resumeStage || "prepare";
+                    state.retryCount = 0;
+                    state.retryQuestionId = state.currentQuestionId || null;
+                    state.recoveryPending = false;
+                    state.lastPageAlert = null;
                     state.lastError = null;
                 }
 
                 writeState(state);
-                ui.start.disabled = true;
-                ui.stop.disabled = false;
+                setPanelRunning(true);
                 ui.copyError.hidden = true;
                 setProgress(state.index, batch.length);
                 setStatus("Starting " + batch.length + " question(s)...");
@@ -1051,16 +1647,20 @@
         });
 
         ui.stop.addEventListener("click", () => {
+            if (recoveryTimer) W.clearTimeout(recoveryTimer);
+            recoveryTimer = null;
             const state = readState() || {};
             state.running = false;
+            state.recoveryPending = false;
             state.status = "Stopped by user.";
             writeState(state);
             setStatus(state.status);
-            ui.start.disabled = false;
-            ui.stop.disabled = true;
+            setPanelRunning(false);
         });
 
         ui.reset.addEventListener("click", () => {
+            if (recoveryTimer) W.clearTimeout(recoveryTimer);
+            recoveryTimer = null;
             try {
                 const batch = readBatch();
                 const state = readState() || {};
@@ -1068,15 +1668,22 @@
                 state.index = 0;
                 state.stage = "prepare";
                 state.completedIds = [];
+                state.skippedIds = [];
+                state.skippedLog = [];
                 state.currentQuestionId = null;
                 state.successPopupHandled = false;
+                state.successPopupAttempts = 0;
+                state.retryQuestionId = null;
+                state.retryCount = 0;
+                state.recoveryPending = false;
+                state.lastPageAlert = null;
+                state.batchSignature = getBatchSignature(batch);
                 state.lastError = null;
                 state.status = "Progress reset. Ready.";
                 writeState(state);
                 setProgress(0, batch.length);
                 setStatus(state.status);
-                ui.start.disabled = false;
-                ui.stop.disabled = true;
+                setPanelRunning(false);
                 ui.copyError.hidden = true;
             } catch (error) {
                 setStatus("ERROR: " + (error?.message || error));
@@ -1090,10 +1697,22 @@
             if (state?.status) setStatus(state.status);
             else setStatus(batch.length + " question(s) loaded. Ready.");
             if (state?.stage === "error" && state.lastError) ui.copyError.hidden = false;
+            setPanelRunning(!!state?.running);
+            updateSkipButton();
         } catch (error) {
             setStatus("No data. Run 01_QUESTION_DATA.js in Snippets.");
         }
     }
+
+    // Catch rejected asynchronous operations that escape a local await/catch.
+    // Only act while this updater is actively processing a question.
+    W.addEventListener("unhandledrejection", event => {
+        const state = readState();
+        if (!state?.running || !localBusy) return;
+        const reason = event?.reason;
+        console.error("[MU QB] Unhandled rejection during batch:", reason);
+        scheduleRecovery(reason instanceof Error ? reason : new Error(String(reason || "Unhandled page rejection")));
+    });
 
     function onReady() {
         if (!D.body) {
@@ -1107,10 +1726,36 @@
             installSuccessPopupObserver();
             createPanel();
 
-            const state = readState();
+            let state = readState();
             if (state?.running) {
-                setStatus("Resuming " + (state.currentQuestionId ? "ID " + state.currentQuestionId : "next question") + "...");
+                if (state.recoveryPending) {
+                    state.recoveryPending = false;
+                    state.status = state.resumeNotice || ("Page refreshed. Resuming Question ID " +
+                        (state.currentQuestionId || "at the next pending record") +
+                        " (automatic retry " + (state.retryCount || 0) + "/" +
+                        RECOVERY.maxRetriesPerQuestion + ")...");
+                    state.resumeNotice = null;
+                    writeState(state);
+                }
+
+                // If the browser was refreshed while a save request was in flight,
+                // the success popup may have been lost. Re-open and re-apply the same
+                // existing record instead of waiting forever for a vanished popup.
+                if (state.stage === "saving") {
+                    state.stage = "prepare";
+                    state.resumeStage = "prepare";
+                    state.successPopupHandled = false;
+                    state.status = "Recovering interrupted save for Question ID " +
+                        (state.currentQuestionId || "current record") +
+                        "; the same record will be safely re-applied.";
+                    writeState(state);
+                }
+
+                setPanelRunning(true);
+                setStatus(state.status || "Resuming...");
                 runEngine();
+            } else {
+                setPanelRunning(false);
             }
         }, 900);
     }
@@ -1131,5 +1776,5 @@
         onReady();
     }
 
-    console.info("[MU QB] Version 7 auto-resume userscript loaded (post-save verification disabled).");
+    console.info("[MU QB] Version 7.3 loaded (mark-aware validation; bounded recovery; explicit skip for permanent marks-dropdown configuration errors; skipped IDs are tracked separately).");
 })();
