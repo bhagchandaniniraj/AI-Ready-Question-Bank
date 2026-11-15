@@ -1,0 +1,1135 @@
+// ==UserScript==
+// @name         Marwadi University Question Bank — Auto Resume Updater
+// @namespace    MU-QuestionBank-Automation
+// @version      7.0.0
+// @description  Auto-updates existing questions without post-save verification, clicks success OK, closes Add New Question, resumes after refresh, and has a draggable compact panel.
+// @match        https://academic.marwadiuniversity.ac.in:553/ManageQuestionBank.aspx*
+// @run-at       document-start
+// @grant        unsafeWindow
+// ==/UserScript==
+
+(function MUQuestionBankAutoResume() {
+    "use strict";
+
+    const W = (typeof unsafeWindow !== "undefined") ? unsafeWindow : window;
+    const D = W.document;
+
+    const DATA_KEY = "__MU_MARWADI_QB_DATA_V7__";
+    const STATE_KEY = "__MU_MARWADI_QB_STATE_V7__";
+    const HOST_ID = "__muQuestionBankAutoResumePanelV7";
+    const POSITION_KEY = "__MU_MARWADI_QB_PANEL_POSITION_V7__";
+
+    // These IDs were read from the ManageQuestionBank.aspx page source supplied
+    // for this update. The grid uses DevExpress paging (100 rows per page).
+    const IDS = {
+        grid: "ctl00_ContentPlaceHolder1_grdQuestionBank",
+        modal: "AddQuestion",
+        cancelButton: "ctl00_ContentPlaceHolder1_btnCancel",
+        hiddenQuestionId: "ctl00_ContentPlaceHolder1_HFQuestionBankID",
+        questionEditor: "ctl00_ContentPlaceHolder1_ckQuestion",
+        answerEditor: "ctl00_ContentPlaceHolder1_ckAnswer",
+        rubricTable: "tblRubrics",
+        addRubric: "ctl00_ContentPlaceHolder1_btnAddRubricRow",
+        saveButton: "ctl00_ContentPlaceHolder1_btnSave"
+    };
+
+    const SUCCESS_TEXT = /record\s+update\s+successfully|record\s+updated\s+successfully|question\s+updated\s+successfully|update\s+successful|successfully\s+updated/i;
+
+    const sleep = ms => new Promise(resolve => W.setTimeout(resolve, ms));
+    const byId = id => D.getElementById(id);
+
+    let ui = null;
+    let localBusy = false;
+    let successObserver = null;
+
+    function readState() {
+        try {
+            const raw = W.localStorage.getItem(STATE_KEY);
+            return raw ? JSON.parse(raw) : null;
+        } catch (error) {
+            console.error("[MU QB] Could not read progress:", error);
+            return null;
+        }
+    }
+
+    function writeState(state) {
+        state.updatedAt = new Date().toISOString();
+        W.localStorage.setItem(STATE_KEY, JSON.stringify(state));
+    }
+
+    function setStatus(message) {
+        const state = readState();
+        if (ui?.status) {
+            ui.status.textContent = message;
+            const isError = state?.stage === "error" ||
+                /^\s*(STOPPED|ERROR|CANNOT|FAILED)/i.test(String(message || ""));
+            ui.status.classList.toggle("error", !!isError);
+            if (ui.copyError) ui.copyError.hidden = !isError;
+        }
+        if (state) {
+            state.status = message;
+            writeState(state);
+        }
+    }
+
+    function setProgress(index, total) {
+        if (ui?.bar) ui.bar.style.width = total ? (Math.round(index / total * 100) + "%") : "0%";
+        if (ui?.count) ui.count.textContent = total ? (index + " / " + total) : "0 / 0";
+    }
+
+    function readBatch() {
+        const raw = W.localStorage.getItem(DATA_KEY);
+        if (!raw) {
+            throw new Error("Question data is not stored. Run 01_QUESTION_DATA.js once in this tab, then reload.");
+        }
+        return validateBatch(JSON.parse(raw));
+    }
+
+    function validateBatch(raw) {
+        if (!Array.isArray(raw) || !raw.length) {
+            throw new Error("Question data must be a non-empty array.");
+        }
+
+        const seen = new Set();
+        return raw.map((item, index) => {
+            if (!item || typeof item !== "object" || Array.isArray(item)) {
+                throw new Error("Question item " + (index + 1) + " is not an object.");
+            }
+
+            const questionId = String(item.questionId ?? "").trim();
+            const question = item.question ?? item.questionPrompt ?? item.updatedQuestion;
+            const answer = item.answer ?? item.expectedAnswer ?? item.solutionKey;
+            const rubric = item.rubric ?? item.markingRubric;
+
+            if (!questionId) throw new Error("Question item " + (index + 1) + " has no questionId.");
+            if (seen.has(questionId)) throw new Error("Duplicate Question ID: " + questionId);
+            seen.add(questionId);
+
+            if (typeof question !== "string" || !question.trim()) {
+                throw new Error("Question ID " + questionId + " has no question text.");
+            }
+            if (typeof answer !== "string" || !answer.trim()) {
+                throw new Error("Question ID " + questionId + " has no answer text.");
+            }
+            if (!Array.isArray(rubric) || !rubric.length) {
+                throw new Error("Question ID " + questionId + " has no rubric rows.");
+            }
+
+            rubric.forEach((row, rowIndex) => {
+                if (!row || !String(row.criterion ?? "").trim() ||
+                    !String(row.expectedEvidence ?? "").trim() ||
+                    row.marks == null || !Number.isFinite(Number(row.marks)) ||
+                    Number(row.marks) < 0) {
+                    throw new Error("Question ID " + questionId +
+                        ", rubric row " + (rowIndex + 1) + " is incomplete or has invalid marks.");
+                }
+            });
+
+            return {
+                questionId,
+                question,
+                answer,
+                rubric: rubric.map(row => ({
+                    criterion: String(row.criterion),
+                    expectedEvidence: String(row.expectedEvidence),
+                    marks: Number(row.marks)
+                }))
+            };
+        });
+    }
+
+    // Intercept only the university's success alert(), if it uses one.
+    // Other alerts are never suppressed.
+    try {
+        const originalAlert = W.alert.bind(W);
+        Object.defineProperty(W, "alert", {
+            configurable: true,
+            writable: true,
+            value: function (message) {
+                const text = String(message ?? "");
+                const state = readState();
+
+                if (state?.running && state.stage === "saving" && SUCCESS_TEXT.test(text)) {
+                    state.stage = "advance";
+                    state.successPopupHandled = true;
+                    state.status = "Success received for Question ID " +
+                        (state.currentQuestionId || "") + ".";
+                    writeState(state);
+                    console.info("[MU QB] Suppressed success alert:", text);
+                    return;
+                }
+
+                if (state?.running && state.stage === "saving") {
+                    state.running = false;
+                    state.stage = "error";
+                    state.resumeStage = "saving";
+                    state.lastError = text || "Unexpected alert during save.";
+                    state.status = "Batch paused: " + state.lastError;
+                    writeState(state);
+                }
+                return originalAlert(message);
+            }
+        });
+    } catch (error) {
+        console.warn("[MU QB] Could not wrap window.alert:", error);
+    }
+
+    // The supplied page loads SweetAlert. Its success popup is HTML, not
+    // window.alert(). Detect that popup and click only its OK/Confirm button.
+    function isVisible(element) {
+        if (!element) return false;
+        const style = W.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            Number(style.opacity || 1) > 0 &&
+            rect.width > 0 && rect.height > 0;
+    }
+
+    function getSuccessPopup() {
+        const buttonNodes = Array.from(D.querySelectorAll(
+            "button, input[type='button'], input[type='submit'], a"
+        ));
+
+        for (const button of buttonNodes) {
+            if (!isVisible(button) || button.disabled) continue;
+            const label = String(
+                button.innerText || button.textContent || button.value || ""
+            ).replace(/\s+/g, " ").trim();
+            if (!/^(ok|okay|confirm|yes)$/i.test(label)) continue;
+
+            let container = button.parentElement;
+            for (let depth = 0; container && container !== D.body && container !== D.documentElement && depth < 8; depth++, container = container.parentElement) {
+                if (!isVisible(container)) continue;
+                const text = String(container.innerText || container.textContent || "")
+                    .replace(/\s+/g, " ").trim();
+                if (SUCCESS_TEXT.test(text)) return { popup: container, button, text };
+            }
+        }
+
+        const candidates = D.querySelectorAll(
+            ".sweet-alert, .swal-modal, .swal2-popup, [role='dialog'], .modal"
+        );
+        for (const popup of candidates) {
+            if (!isVisible(popup)) continue;
+            const text = String(popup.innerText || popup.textContent || "")
+                .replace(/\s+/g, " ").trim();
+            if (!SUCCESS_TEXT.test(text)) continue;
+            const ok = Array.from(popup.querySelectorAll(
+                "button, input[type='button'], input[type='submit']"
+            )).find(button => {
+                const label = String(button.innerText || button.textContent || button.value || "")
+                    .replace(/\s+/g, " ").trim();
+                return /^(ok|okay|confirm|yes)$/i.test(label) && !button.disabled;
+            });
+            if (ok) return { popup, button: ok, text };
+        }
+        return null;
+    }
+    function handleSuccessPopup() {
+        const state = readState();
+        if (!state?.running || state.stage !== "saving" || state.successPopupHandled) return;
+
+        const found = getSuccessPopup();
+        if (!found) return;
+
+        // Save the next state BEFORE clicking OK. If OK causes a page refresh,
+        // the next document will continue at the advance stage without re-opening the record.
+        state.stage = "advance";
+        state.successPopupHandled = true;
+        state.status = "Success popup detected. Automatically clicking OK for Question ID " +
+            (state.currentQuestionId || "") + "...";
+        writeState(state);
+        setStatus(state.status);
+
+        W.setTimeout(() => {
+            try {
+                if (found.button && found.button.isConnected && isVisible(found.button)) {
+                    found.button.click();
+                }
+            } catch (error) {
+                console.error("[MU QB] Could not auto-click success OK:", error);
+            }
+        }, 350);
+    }
+
+    function installSuccessPopupObserver() {
+        if (successObserver || !D.documentElement) return;
+        successObserver = new W.MutationObserver(() => handleSuccessPopup());
+        successObserver.observe(D.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["class", "style", "aria-hidden"]
+        });
+        // Also check in case the popup was added before the observer.
+        handleSuccessPopup();
+    }
+
+    function waitFor(getter, label, timeout = 20000) {
+        return new Promise((resolve, reject) => {
+            const started = Date.now();
+            const poll = () => {
+                let result;
+                try { result = getter(); } catch (_) {}
+                if (result) return resolve(result);
+
+                const state = readState();
+                if (!state?.running) {
+                    return reject(new Error("Batch stopped while waiting for " + label + "."));
+                }
+                if (Date.now() - started > timeout) {
+                    return reject(new Error("Timed out waiting for " + label + "."));
+                }
+                W.setTimeout(poll, 150);
+            };
+            poll();
+        });
+    }
+
+    function modalElement() {
+        return byId(IDS.modal);
+    }
+
+    function modalIsVisible() {
+        const modal = modalElement();
+        if (!modal) return false;
+
+        const style = W.getComputedStyle(modal);
+        const rect = modal.getBoundingClientRect();
+        if (style.display === "none" || style.visibility === "hidden" ||
+            rect.width === 0 || rect.height === 0) return false;
+
+        // Bootstrap 3 on this page uses the "in" class when the modal is open.
+        // "show" is also accepted for newer Bootstrap markup.
+        if (modal.classList.contains("in") || modal.classList.contains("show") ||
+            modal.getAttribute("aria-hidden") === "false") return true;
+
+        return !!D.querySelector(".modal-backdrop") && isVisible(modal);
+    }
+
+    function currentFormQuestionId() {
+        return String(byId(IDS.hiddenQuestionId)?.value || "").trim();
+    }
+
+    function modalTitleText() {
+        const modal = modalElement();
+        if (!modal) return "";
+        const title = modal.querySelector(
+            ".modal-title, .modal-header h1, .modal-header h2, .modal-header h3, .modal-header h4, [data-modal-title]"
+        );
+        if (title) return String(title.textContent || "").replace(/\s+/g, " ").trim();
+        const header = modal.querySelector(".modal-header");
+        return String(header?.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isBlankAddQuestionForm() {
+        if (!modalIsVisible()) return false;
+
+        const title = modalTitleText();
+        if (/add\s+new\s+question/i.test(title)) return true;
+
+        const modal = modalElement();
+        const footer = modal?.querySelector(".modal-footer") || modal;
+        const labels = Array.from(footer?.querySelectorAll(
+            "button, input[type='button'], input[type='submit'], a"
+        ) || []).map(node =>
+            String(node.innerText || node.textContent || node.value || "")
+                .replace(/\s+/g, " ").trim().toUpperCase()
+        ).join(" ");
+
+        if (/ADD\s+QUESTION/.test(labels) && !/UPDATE\s+QUESTION/.test(labels)) return true;
+
+        const id = currentFormQuestionId();
+        return !id || id === "0";
+    }
+
+    function getQuestionRows() {
+        const grid = byId(IDS.grid);
+        if (!grid) return [];
+        return Array.from(grid.querySelectorAll("tr[id*='_DXDataRow']"));
+    }
+
+    function findQuestionRow(questionId) {
+        const wanted = String(questionId).trim();
+        return getQuestionRows().find(row =>
+            row.cells && row.cells[1] &&
+            String(row.cells[1].textContent || "").trim() === wanted
+        ) || null;
+    }
+
+    function getPagerInfo() {
+        const pager = byId(IDS.grid + "_DXPagerBottom");
+        const summary = pager?.querySelector(".dxp-summary");
+        const text = String(summary?.textContent || "");
+        const match = text.match(/Page\s+(\d+)\s+of\s+(\d+)/i);
+        if (!match) return null;
+        return {
+            current: Number(match[1]) - 1,
+            count: Number(match[2])
+        };
+    }
+
+    function getGridClient() {
+        try {
+            return W.grdQuestionBank ||
+                W.ASPx?.GetControlCollection?.().GetByName("grdQuestionBank") ||
+                null;
+        } catch (_) {
+            return W.grdQuestionBank || null;
+        }
+    }
+
+    async function goToGridPage(pageIndex) {
+        const before = getPagerInfo();
+        if (!before || before.current === pageIndex) return;
+
+        const gridClient = getGridClient();
+        if (gridClient && typeof gridClient.GotoPage === "function") {
+            gridClient.GotoPage(pageIndex);
+        } else if (W.ASPx && typeof W.ASPx.GVPagerOnClick === "function") {
+            W.ASPx.GVPagerOnClick(IDS.grid, "PN" + pageIndex);
+        } else {
+            const pager = byId(IDS.grid + "_DXPagerBottom");
+            const link = Array.from(pager?.querySelectorAll("a.dxp-num") || [])
+                .find(anchor => Number(anchor.textContent.trim()) === pageIndex + 1);
+            if (!link) throw new Error("Could not navigate to Question Bank grid page " + (pageIndex + 1) + ".");
+            link.click();
+        }
+
+        await waitFor(() => {
+            const info = getPagerInfo();
+            return info && info.current === pageIndex;
+        }, "Question Bank grid page " + (pageIndex + 1), 25000);
+        await sleep(250);
+    }
+
+    async function findQuestionRowAcrossPages(questionId) {
+        let row = findQuestionRow(questionId);
+        if (row) return row;
+
+        const pagerInfo = getPagerInfo();
+        if (!pagerInfo || pagerInfo.count < 1) {
+            throw new Error("Question ID " + questionId +
+                " is not on the current grid page and the grid pager could not be read.");
+        }
+
+        const pageOrder = [];
+        for (let offset = 1; offset <= pagerInfo.count; offset++) {
+            pageOrder.push((pagerInfo.current + offset) % pagerInfo.count);
+        }
+
+        for (const pageIndex of pageOrder) {
+            await goToGridPage(pageIndex);
+            row = findQuestionRow(questionId);
+            if (row) return row;
+        }
+
+        throw new Error("Question ID " + questionId +
+            " was not found in any of the " + pagerInfo.count + " grid pages.");
+    }
+
+    function hideAddQuestionModal() {
+        const modal = modalElement();
+        if (!modal || !modalIsVisible()) return Promise.resolve();
+
+        try {
+            if (W.jQuery && W.jQuery.fn && typeof W.jQuery.fn.modal === "function") {
+                W.jQuery(modal).modal("hide");
+            } else {
+                const closeLink = modal.querySelector("a.close");
+                if (closeLink) closeLink.click();
+                else throw new Error("The Add Question modal close control was not found.");
+            }
+        } catch (error) {
+            return Promise.reject(error);
+        }
+
+        return waitFor(() => !modalIsVisible(),
+            "Add Question form to close", 12000).then(() => {
+                try { if (typeof W.HideModal === "function") W.HideModal(); } catch (_) {}
+            });
+    }
+
+    async function closeBlankAddQuestionFormIfNeeded() {
+        if (!modalIsVisible() || !isBlankAddQuestionForm()) return;
+
+        const modal = modalElement();
+        const title = modalTitleText() || "Add New Question";
+        setStatus("Closing blank form...");
+
+        const footer = modal?.querySelector(".modal-footer") || modal;
+        const cancel = byId(IDS.cancelButton) ||
+            Array.from(footer?.querySelectorAll(
+                "button, input[type='button'], input[type='submit'], a"
+            ) || []).find(node => {
+                const label = String(node.innerText || node.textContent || node.value || "")
+                    .replace(/\s+/g, " ").trim();
+                return /^cancel$/i.test(label) && !node.disabled;
+            });
+
+        if (cancel) {
+            cancel.click();
+        } else if (W.jQuery && W.jQuery.fn && typeof W.jQuery.fn.modal === "function") {
+            W.jQuery(modal).modal("hide");
+        } else {
+            const closeLink = modal?.querySelector("a.close, button.close, [data-dismiss='modal']");
+            if (closeLink) closeLink.click();
+            else throw new Error(
+                "Blank Add New Question form is open, but its Cancel/Close button was not found. Visible title: " +
+                title + "."
+            );
+        }
+
+        try {
+            await waitFor(() => !modalIsVisible(),
+                "blank Add New Question form to close using Cancel", 9000);
+        } catch (firstError) {
+            if (W.jQuery && W.jQuery.fn && typeof W.jQuery.fn.modal === "function") {
+                W.jQuery(modal).modal("hide");
+                await waitFor(() => !modalIsVisible(),
+                    "blank Add New Question form to close", 9000);
+            } else {
+                throw new Error(
+                    "Could not close the blank Add New Question form. Cancel click did not hide it. " +
+                    "Original detail: " + firstError.message
+                );
+            }
+        }
+        await sleep(250);
+    }
+
+    function runPartialPostback(action, label, timeout = 25000) {
+        const prm = W.Sys?.WebForms?.PageRequestManager?.getInstance?.();
+        if (!prm) {
+            action();
+            return sleep(1000);
+        }
+
+        return new Promise((resolve, reject) => {
+            let finished = false;
+            let timer;
+
+            const cleanup = () => {
+                try { prm.remove_endRequest(onEnd); } catch (_) {}
+                W.clearTimeout(timer);
+            };
+
+            const onEnd = (sender, args) => {
+                if (finished) return;
+                finished = true;
+                cleanup();
+                const error = args?.get_error?.();
+                if (error) reject(new Error(label + " failed: " + (error.message || error)));
+                else resolve();
+            };
+
+            prm.add_endRequest(onEnd);
+            timer = W.setTimeout(() => {
+                if (finished) return;
+                finished = true;
+                cleanup();
+                reject(new Error(label + " did not finish. Check the university page."));
+            }, timeout);
+
+            try {
+                action();
+            } catch (error) {
+                if (!finished) {
+                    finished = true;
+                    cleanup();
+                    reject(error);
+                }
+            }
+        });
+    }
+
+    async function openExistingQuestion(questionId) {
+        await closeBlankAddQuestionFormIfNeeded();
+
+        if (modalIsVisible()) {
+            if (isBlankAddQuestionForm()) {
+                throw new Error("The blank Add New Question form is still open after the Cancel attempt.");
+            }
+            const openId = currentFormQuestionId();
+            if (openId === questionId) return;
+            throw new Error("A different existing question is already open (ID " +
+                (openId || "unknown") + "). Refusing to edit the wrong record.");
+        }
+
+        const row = await findQuestionRowAcrossPages(questionId);
+        const editLink = row.querySelector('a[title="Edit Question"]');
+        if (!editLink) {
+            throw new Error("Edit Question link not found for Question ID " + questionId + ".");
+        }
+
+        setStatus("Opening existing Question ID " + questionId + "...");
+        await runPartialPostback(() => editLink.click(), "Opening Question ID " + questionId);
+
+        await waitFor(
+            () => modalIsVisible() && currentFormQuestionId() === questionId,
+            "Edit form for Question ID " + questionId,
+            25000
+        );
+
+        if (currentFormQuestionId() !== questionId) {
+            throw new Error("Safety check failed: edit form ID is not " + questionId + ".");
+        }
+    }
+
+    function getRubricRows() {
+        const table = byId(IDS.rubricTable);
+        const tbody = table?.tBodies?.[0];
+        return tbody ? Array.from(tbody.rows).filter(row => row.cells && row.cells.length >= 3) : [];
+    }
+
+    async function ensureRubricRowCount(requiredCount, questionId) {
+        let count = getRubricRows().length;
+        if (count > requiredCount) {
+            throw new Error("Question ID " + questionId + " currently has " + count +
+                " rubric rows but the data file has " + requiredCount +
+                ". The script will not delete existing rubric rows automatically.");
+        }
+
+        while (count < requiredCount) {
+            const before = count;
+            setStatus("Question ID " + questionId + ": adding rubric row " +
+                (count + 1) + " of " + requiredCount + "...");
+
+            await runPartialPostback(() => {
+                const button = byId(IDS.addRubric);
+                if (!button) throw new Error("Rubric Add Row button was not found.");
+                button.click();
+            }, "Adding rubric row");
+
+            await waitFor(() => getRubricRows().length > before,
+                "new rubric row for Question ID " + questionId);
+            count = getRubricRows().length;
+        }
+    }
+
+    function controlInCell(cell) {
+        return cell?.querySelector(
+            'input:not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="image"]), textarea, select'
+        ) || null;
+    }
+
+    function setControl(control, value, description) {
+        if (!control) throw new Error("Could not find " + description + " input in the rubric.");
+        control.value = String(value ?? "");
+        control.dispatchEvent(new W.Event("input", { bubbles: true }));
+        control.dispatchEvent(new W.Event("change", { bubbles: true }));
+        if (W.jQuery) W.jQuery(control).trigger("change");
+    }
+
+    function populateRubrics(rubrics, questionId) {
+        const rows = getRubricRows();
+        if (rows.length !== rubrics.length) {
+            throw new Error("Question ID " + questionId + ": expected " + rubrics.length +
+                " rubric rows, found " + rows.length + ".");
+        }
+
+        rubrics.forEach((rubric, index) => {
+            const cells = rows[index].cells;
+            setControl(controlInCell(cells[0]), rubric.criterion, "Criterion row " + (index + 1));
+            setControl(controlInCell(cells[1]), rubric.expectedEvidence, "Expected Evidence row " + (index + 1));
+            setControl(controlInCell(cells[2]), rubric.marks, "Marks row " + (index + 1));
+        });
+    }
+
+    async function setEditorHtml(editorId, html, label) {
+        const editor = await waitFor(
+            () => W.CKEDITOR?.instances?.[editorId],
+            label + " CKEditor",
+            18000
+        );
+
+        await new Promise((resolve, reject) => {
+            try {
+                editor.setData(String(html), {
+                    callback: function () {
+                        editor.updateElement();
+                        resolve();
+                    }
+                });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    function getVisibleValidationMessages() {
+        const selectors = [
+            "#AddQuestion .validation-summary-errors",
+            "#AddQuestion .field-validation-error",
+            "#AddQuestion .alert-danger",
+            "#AddQuestion [role='alert']"
+        ];
+        const messages = [];
+        for (const selector of selectors) {
+            D.querySelectorAll(selector).forEach(element => {
+                if (!isVisible(element)) return;
+                const message = String(element.textContent || "").replace(/\s+/g, " ").trim();
+                if (message && !messages.includes(message)) messages.push(message);
+            });
+        }
+        return messages;
+    }
+
+    async function waitForSuccessConfirmation(questionId) {
+        await waitFor(() => {
+            const state = readState();
+            return state && state.stage === "advance" && state.successPopupHandled === true;
+        }, "success popup and automatic OK click for Question ID " + questionId, 60000);
+    }
+
+    async function clickUpdateAndWait(item, index, total) {
+        const state = readState();
+        if (!state?.running) throw new Error("Batch stopped before Update.");
+
+        if (!modalIsVisible() || currentFormQuestionId() !== item.questionId) {
+            throw new Error("Safety stop: refusing to click Update because the open form is not Question ID " +
+                item.questionId + ".");
+        }
+
+        const saveButton = byId(IDS.saveButton);
+        if (!saveButton || saveButton.disabled) {
+            throw new Error("Update button is missing or disabled for Question ID " + item.questionId + ".");
+        }
+
+        state.stage = "saving";
+        state.currentQuestionId = item.questionId;
+        state.successPopupHandled = false;
+        state.status = "Submitting Update for Question ID " + item.questionId + "...";
+        writeState(state);
+
+        setStatus("Question " + (index + 1) + "/" + total +
+            " — automatically clicking Update for ID " + item.questionId + "...");
+
+        if (currentFormQuestionId() !== item.questionId) {
+            throw new Error("Last-second Question ID check failed; Update was not clicked.");
+        }
+
+        saveButton.click();
+        await waitForSuccessConfirmation(item.questionId);
+    }
+
+    async function advanceAfterSave(item, total) {
+        setStatus("Finishing Question ID " + item.questionId + "...");
+
+        // Wait for the success popup's automatic OK click, then close the
+        // blank Add New Question form. No post-save record/editor verification
+        // is performed; the success confirmation advances the batch.
+        await waitFor(() => !getSuccessPopup(),
+            "success popup to close after automatic OK click", 12000);
+        await closeBlankAddQuestionFormIfNeeded();
+
+        const state = readState();
+        if (!state || !state.running) return;
+
+        if (!Array.isArray(state.completedIds)) state.completedIds = [];
+        if (!state.completedIds.includes(item.questionId)) {
+            state.completedIds.push(item.questionId);
+        }
+
+        state.index += 1;
+        state.currentQuestionId = null;
+        state.successPopupHandled = false;
+        state.stage = "prepare";
+        state.status = "Success confirmation received: " + state.completedIds.length +
+            "/" + total + " processed. Last ID: " + item.questionId + ".";
+        writeState(state);
+
+        setProgress(state.index, total);
+        setStatus(state.status);
+    }
+
+    async function runEngine() {
+        if (localBusy) return;
+        localBusy = true;
+
+        try {
+            const batch = readBatch();
+
+            while (true) {
+                const state = readState();
+                if (!state || !state.running) break;
+
+                if (state.index >= batch.length) {
+                    state.running = false;
+                    state.stage = "done";
+                    state.currentQuestionId = null;
+                    state.status = "Completed all " + batch.length +
+                        " update(s). Success confirmations received. IDs: " + (state.completedIds || []).join(", ");
+                    writeState(state);
+                    setProgress(batch.length, batch.length);
+                    setStatus(state.status);
+                    break;
+                }
+
+                const item = batch[state.index];
+                setProgress(state.index, batch.length);
+
+                if (state.stage === "saving") {
+                    setStatus("Waiting for the university success popup for Question ID " +
+                        item.questionId + "...");
+                    await waitForSuccessConfirmation(item.questionId);
+                    continue;
+                }
+
+                if (state.stage === "advance") {
+                    await advanceAfterSave(item, batch.length);
+                    continue;
+                }
+
+                if (state.stage !== "prepare") {
+                    throw new Error("Unknown automation stage: " + state.stage);
+                }
+
+                setStatus("Question " + (state.index + 1) + "/" + batch.length +
+                    " — preparing existing Question ID " + item.questionId + "...");
+
+                await closeBlankAddQuestionFormIfNeeded();
+                await openExistingQuestion(item.questionId);
+
+                if (currentFormQuestionId() !== item.questionId) {
+                    throw new Error("Safety check failed: expected Question ID " +
+                        item.questionId + ", found " + (currentFormQuestionId() || "unknown") + ".");
+                }
+
+                await ensureRubricRowCount(item.rubric.length, item.questionId);
+                populateRubrics(item.rubric, item.questionId);
+
+                await setEditorHtml(IDS.questionEditor, item.question, "Question Prompt");
+                await setEditorHtml(IDS.answerEditor, item.answer, "Expected Answer");
+
+                if (currentFormQuestionId() !== item.questionId) {
+                    throw new Error("Final identity check failed before saving Question ID " +
+                        item.questionId + ".");
+                }
+
+                const validation = getVisibleValidationMessages();
+                if (validation.length) {
+                    throw new Error("Validation message before Update: " + validation.join(" | "));
+                }
+
+                await clickUpdateAndWait(item, state.index, batch.length);
+                // Next loop advances after the success confirmation. If the page
+                // fully reloads, localStorage carries stage="advance" into the new document.
+            }
+        } catch (error) {
+            console.error("[MU QB] Auto updater stopped:", error);
+            const state = readState() || {};
+            const resumeStage = (state.stage === "saving" || state.stage === "advance")
+                ? state.stage : "prepare";
+            state.running = false;
+            state.stage = "error";
+            state.resumeStage = resumeStage;
+            state.lastError = error?.stack || error?.message || String(error);
+            state.status = "ERROR: " + (error?.message || String(error)) +
+                "\\nID: " + (state.currentQuestionId || "not set") +
+                " | Processed: " + ((state.completedIds || []).length);
+            writeState(state);
+            setStatus(state.status);
+        } finally {
+            localBusy = false;
+            if (ui) {
+                ui.start.disabled = false;
+                ui.stop.disabled = true;
+            }
+        }
+    }
+
+    function createPanel() {
+        if (byId(HOST_ID)) return;
+
+        const host = D.createElement("div");
+        host.id = HOST_ID;
+        host.style.cssText =
+            "position:fixed;right:12px;bottom:12px;z-index:2147483647;width:min(310px,calc(100vw - 24px));font-family:Arial,Helvetica,sans-serif;";
+        const shadow = host.attachShadow({ mode: "open" });
+
+        shadow.innerHTML = `
+          <style>
+            *{box-sizing:border-box}
+            .panel{background:#fff;color:#1f2937;border:1px solid #cbd5e1;border-radius:9px;box-shadow:0 5px 18px rgba(0,0,0,.20);overflow:hidden}
+            .head{display:flex;align-items:center;gap:8px;padding:7px 9px;background:#173b2b;color:#fff;font-size:12px;font-weight:700;cursor:move;user-select:none;touch-action:none}
+            .brand{display:flex;flex-direction:column;gap:1px;flex:1;min-width:0}
+            .title{font-size:12px;line-height:14px}
+            .byline{font-size:9px;line-height:11px;font-weight:500;opacity:.82;white-space:nowrap}
+            #count{font-size:11px;font-weight:600;opacity:.9}
+            #collapse{background:transparent;color:#fff;padding:0 4px;font-size:16px;line-height:16px}
+            .body{padding:8px}
+            .status{padding:7px 8px;border-radius:6px;background:#f1f5f9;color:#334155;font-size:11px;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere;max-height:92px;overflow:auto}
+            .status.error{background:#fff1f2;color:#9f1239;border:1px solid #fecdd3}
+            .progress{height:5px;background:#e2e8f0;border-radius:10px;overflow:hidden;margin:7px 0}
+            .bar{height:100%;width:0;background:#16a34a;transition:width .2s}
+            .buttons{display:flex;gap:5px;flex-wrap:wrap}
+            button{border:0;border-radius:5px;padding:6px 8px;cursor:pointer;font-size:10px;font-weight:700}
+            #start{background:#17643b;color:#fff}
+            #stop{background:#fee2e2;color:#991b1b}
+            #reset{background:#e2e8f0;color:#334155}
+            #copyError{background:#9f1239;color:#fff}
+            button:disabled{opacity:.45;cursor:not-allowed}
+            #copyError[hidden]{display:none}
+            .collapsed .body{display:none}
+          </style>
+          <div class="panel" id="panel">
+            <div class="head" id="head">
+              <span class="brand"><span class="title">MU QB Auto</span><span class="byline">Script by Niraj Bhagchandani</span></span>
+              <span id="count">0 / 0</span>
+              <button id="collapse" title="Minimize">−</button>
+            </div>
+            <div class="body">
+              <div class="status" id="status">Checking question data...</div>
+              <div class="progress"><div class="bar" id="bar"></div></div>
+              <div class="buttons">
+                <button id="start">Start / Resume</button>
+                <button id="stop" disabled>Stop</button>
+                <button id="reset">Reset</button>
+                <button id="copyError" hidden>Copy error</button>
+              </div>
+            </div>
+          </div>
+        `;
+
+        D.body.appendChild(host);
+
+        // Restore the last user-selected panel position after page refresh.
+        try {
+            const savedPosition = JSON.parse(W.localStorage.getItem(POSITION_KEY) || "null");
+            if (savedPosition && Number.isFinite(savedPosition.left) && Number.isFinite(savedPosition.top)) {
+                const left = Math.max(0, Math.min(savedPosition.left, W.innerWidth - host.offsetWidth));
+                const top = Math.max(0, Math.min(savedPosition.top, W.innerHeight - host.offsetHeight));
+                host.style.left = left + "px";
+                host.style.top = top + "px";
+                host.style.right = "auto";
+                host.style.bottom = "auto";
+            }
+        } catch (_) {}
+
+        const get = id => shadow.getElementById(id);
+
+        ui = {
+            start: get("start"),
+            stop: get("stop"),
+            reset: get("reset"),
+            copyError: get("copyError"),
+            status: get("status"),
+            bar: get("bar"),
+            count: get("count"),
+            panel: get("panel"),
+            head: get("head"),
+            collapse: get("collapse")
+        };
+
+        ui.collapse.addEventListener("click", () => {
+            const collapsed = ui.panel.classList.toggle("collapsed");
+            ui.collapse.textContent = collapsed ? "+" : "−";
+            ui.collapse.title = collapsed ? "Expand" : "Minimize";
+        });
+
+        // Drag the floating panel by holding its green title bar.
+        let dragState = null;
+        ui.head.addEventListener("pointerdown", event => {
+            if (event.button !== 0 || event.target?.closest?.("button")) return;
+            const rect = host.getBoundingClientRect();
+            dragState = {
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                left: rect.left,
+                top: rect.top
+            };
+            host.style.left = rect.left + "px";
+            host.style.top = rect.top + "px";
+            host.style.right = "auto";
+            host.style.bottom = "auto";
+            try { ui.head.setPointerCapture(event.pointerId); } catch (_) {}
+            event.preventDefault();
+        });
+
+        ui.head.addEventListener("pointermove", event => {
+            if (!dragState || event.pointerId !== dragState.pointerId) return;
+            const maxLeft = Math.max(0, W.innerWidth - host.offsetWidth);
+            const maxTop = Math.max(0, W.innerHeight - host.offsetHeight);
+            const left = Math.max(0, Math.min(
+                dragState.left + event.clientX - dragState.startX, maxLeft
+            ));
+            const top = Math.max(0, Math.min(
+                dragState.top + event.clientY - dragState.startY, maxTop
+            ));
+            host.style.left = left + "px";
+            host.style.top = top + "px";
+        });
+
+        const finishDrag = event => {
+            if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
+            dragState = null;
+            const rect = host.getBoundingClientRect();
+            try {
+                W.localStorage.setItem(POSITION_KEY, JSON.stringify({
+                    left: Math.round(rect.left),
+                    top: Math.round(rect.top)
+                }));
+            } catch (_) {}
+        };
+        ui.head.addEventListener("pointerup", finishDrag);
+        ui.head.addEventListener("pointercancel", finishDrag);
+        W.addEventListener("resize", () => {
+            const rect = host.getBoundingClientRect();
+            const left = Math.max(0, Math.min(rect.left, W.innerWidth - host.offsetWidth));
+            const top = Math.max(0, Math.min(rect.top, W.innerHeight - host.offsetHeight));
+            host.style.left = left + "px";
+            host.style.top = top + "px";
+            host.style.right = "auto";
+            host.style.bottom = "auto";
+            try {
+                W.localStorage.setItem(POSITION_KEY, JSON.stringify({
+                    left: Math.round(left), top: Math.round(top)
+                }));
+            } catch (_) {}
+        });
+
+        ui.copyError.addEventListener("click", async () => {
+            const state = readState() || {};
+            const details = [
+                "Marwadi University Question Bank automation error",
+                state.status || "",
+                "",
+                state.lastError || "No stack trace stored."
+            ].join("\\n");
+            try {
+                await W.navigator.clipboard.writeText(details);
+                ui.copyError.textContent = "Copied";
+                W.setTimeout(() => { if (ui?.copyError) ui.copyError.textContent = "Copy error"; }, 1500);
+            } catch (_) {
+                const textarea = D.createElement("textarea");
+                textarea.value = details;
+                textarea.style.position = "fixed";
+                textarea.style.opacity = "0";
+                D.body.appendChild(textarea);
+                textarea.select();
+                try { D.execCommand("copy"); } catch (_) {}
+                textarea.remove();
+                ui.copyError.textContent = "Copy attempted";
+                W.setTimeout(() => { if (ui?.copyError) ui.copyError.textContent = "Copy error"; }, 1500);
+            }
+        });
+
+        ui.start.addEventListener("click", () => {
+            try {
+                const batch = readBatch();
+                let state = readState();
+
+                if (!state || state.stage === "done" || state.index >= batch.length) {
+                    state = {
+                        running: true,
+                        index: 0,
+                        stage: "prepare",
+                        completedIds: [],
+                        currentQuestionId: null,
+                        successPopupHandled: false,
+                        lastError: null
+                    };
+                } else {
+                    state.running = true;
+                    if (state.stage === "error") state.stage = state.resumeStage || "prepare";
+                    state.lastError = null;
+                }
+
+                writeState(state);
+                ui.start.disabled = true;
+                ui.stop.disabled = false;
+                ui.copyError.hidden = true;
+                setProgress(state.index, batch.length);
+                setStatus("Starting " + batch.length + " question(s)...");
+                runEngine();
+            } catch (error) {
+                setStatus("ERROR: " + (error?.message || error));
+            }
+        });
+
+        ui.stop.addEventListener("click", () => {
+            const state = readState() || {};
+            state.running = false;
+            state.status = "Stopped by user.";
+            writeState(state);
+            setStatus(state.status);
+            ui.start.disabled = false;
+            ui.stop.disabled = true;
+        });
+
+        ui.reset.addEventListener("click", () => {
+            try {
+                const batch = readBatch();
+                const state = readState() || {};
+                state.running = false;
+                state.index = 0;
+                state.stage = "prepare";
+                state.completedIds = [];
+                state.currentQuestionId = null;
+                state.successPopupHandled = false;
+                state.lastError = null;
+                state.status = "Progress reset. Ready.";
+                writeState(state);
+                setProgress(0, batch.length);
+                setStatus(state.status);
+                ui.start.disabled = false;
+                ui.stop.disabled = true;
+                ui.copyError.hidden = true;
+            } catch (error) {
+                setStatus("ERROR: " + (error?.message || error));
+            }
+        });
+
+        try {
+            const batch = readBatch();
+            const state = readState();
+            setProgress(state?.index || 0, batch.length);
+            if (state?.status) setStatus(state.status);
+            else setStatus(batch.length + " question(s) loaded. Ready.");
+            if (state?.stage === "error" && state.lastError) ui.copyError.hidden = false;
+        } catch (error) {
+            setStatus("No data. Run 01_QUESTION_DATA.js in Snippets.");
+        }
+    }
+
+    function onReady() {
+        if (!D.body) {
+            W.setTimeout(onReady, 100);
+            return;
+        }
+
+        // Let the page's own jQuery/Bootstrap ready handlers finish hiding its
+        // initial blank Add Question modal before inspecting the form.
+        W.setTimeout(() => {
+            installSuccessPopupObserver();
+            createPanel();
+
+            const state = readState();
+            if (state?.running) {
+                setStatus("Resuming " + (state.currentQuestionId ? "ID " + state.currentQuestionId : "next question") + "...");
+                runEngine();
+            }
+        }, 900);
+    }
+
+    function waitForDocumentRoot() {
+        if (D.documentElement) {
+            installSuccessPopupObserver();
+            return;
+        }
+        W.setTimeout(waitForDocumentRoot, 50);
+    }
+
+    waitForDocumentRoot();
+
+    if (D.readyState === "loading") {
+        D.addEventListener("DOMContentLoaded", onReady, { once: true });
+    } else {
+        onReady();
+    }
+
+    console.info("[MU QB] Version 7 auto-resume userscript loaded (post-save verification disabled).");
+})();
