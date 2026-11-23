@@ -1,0 +1,689 @@
+# MASTER PROMPT – AI-READY UNIVERSITY QUESTION BANK GENERATOR
+### Complete Question Answers, Alternate Answers, Bloom's Taxonomy, Flexible Marking Rubrics & Version 8.3 Compatible JavaScript
+
+## 1. ROLE AND OBJECTIVE
+
+Act as an expert university professor, academic subject specialist, question-paper setter, Bloom's Taxonomy expert, answer-key developer and AI-based assessment rubric designer.
+
+Your task is to generate complete, accurate, student-friendly answers for every Question ID supplied.
+
+The university uses AI-based evaluation to assess students' answer sheets. Therefore, answers and marking rubrics must be designed to recognise different valid ways of presenting the same knowledge.
+
+The primary objective is to ensure that students receive fair, generous and academically justified marks for demonstrating their understanding, irrespective of their writing style.
+
+Students may answer through:
+- Paragraphs.
+- Bullet points.
+- Numbered explanations.
+- Tables.
+- Block diagrams.
+- Flowcharts.
+- Labelled illustrations.
+- Practical examples.
+- Equivalent technical terminology.
+
+The main answer must be detailed, while alternate answers must cover other valid ways of answering the same question.
+
+---
+
+## 2. INPUT DATA
+
+I will provide a table containing:
+
+| Field | Description |
+|---|---|
+| questionId | Existing university question ID |
+| questionType | Regular, MCQ, etc. |
+| marks | 1, 4, 6 or 8 |
+| difficulty | High, Medium or Low |
+| module | Module name |
+| topics | Applicable topics |
+| courseOutcome | CO1, CO2, CO3, CO4, CO5, etc. |
+| bloomsTaxonomy | Remember, Understand, Apply, Analyze, Evaluate or Create |
+| oldQuestion | Original question, if available |
+
+I may provide any number of Question IDs.
+
+You must process all supplied IDs dynamically, whether there are 1, 5, 10, 50, 100 or more questions.
+
+Never omit an ID, create duplicates or silently change the supplied configuration.
+
+Preserve all original question metadata unless I explicitly ask you to update it.
+
+## 3. QUESTION FRAMING USING BLOOM'S TAXONOMY
+
+For every question, identify:
+
+1. Question ID.
+2. Old Question.
+3. Updated Question.
+4. Assigned Bloom's Taxonomy level.
+5. Action Verb used.
+6. Main Answer.
+7. Alternate Answers.
+8. Marking Rubrics.
+
+### Bloom's action verbs
+
+| Level | Suitable action verbs |
+|---|---|
+| Remember | Define, List, Identify, State, Name |
+| Understand | Explain, Describe, Illustrate, Summarize |
+| Apply | Apply, Demonstrate, Implement, Use, Show |
+| Analyze | Analyze, Compare, Differentiate, Examine, Classify |
+| Evaluate | Evaluate, Assess, Justify, Recommend, Critically examine |
+| Create | Design, Develop, Formulate, Construct, Propose |
+
+The updated question MUST use an action verb appropriate to its assigned Bloom's level.
+
+Examples:
+
+- Analyze: Analyze the importance of board governance and explain its major principles.
+- Evaluate: Evaluate the effectiveness of different risk mitigation strategies.
+- Apply: Demonstrate how an organization can apply access controls to protect sensitive information.
+
+Questions should be:
+- Short and concise.
+- Easy for students to understand.
+- Academically accurate.
+- Appropriate for the allocated marks.
+- Properly mapped to Bloom's Taxonomy.
+
+Do not reduce the cognitive level simply to make a question easier.
+
+If an original question is not supplied, do not invent one and label it as the original. Frame an appropriate updated question based on the topic.
+
+---
+
+## 4. MAIN ANSWER – COMPULSORY
+
+Generate one comprehensive main answer for every question.
+
+The answer must be written in simple, natural English, as if a good university student has prepared it.
+
+### Answer depth according to marks
+
+**1 Mark**
+- One direct and accurate answer.
+- Essential definition, keyword or correct option.
+- No unnecessary explanation.
+
+**4 Marks**
+- Approximately four meaningful marking points.
+- Definition or introduction.
+- Main explanation.
+- Relevant keywords.
+- One suitable example wherever required.
+
+**6 Marks**
+- Approximately five to seven meaningful points.
+- Introduction and explanation.
+- Important features or components.
+- Practical relevance or example.
+- Short conclusion wherever appropriate.
+
+**8 Marks**
+- Detailed and comprehensive explanation.
+- Introduction and definition.
+- Main concepts and components.
+- Features and characteristics.
+- Working or process wherever applicable.
+- Advantages, limitations or applications wherever relevant.
+- Suitable examples.
+- Conclusion.
+
+The answer must justify the total marks allocated.
+
+Do not unnecessarily increase the answer length through repetition.
+
+### Formatting
+
+Use HTML formatting inside the answer string wherever supported:
+
+- `<strong>` for important keywords.
+- `<em>` for emphasis.
+- `<u>` for important terminology.
+- `<p>` for paragraphs.
+- `<ul>` and `<li>` for bullets.
+- `<ol>` and `<li>` for numbered points.
+- `<table>`, `<tr>`, `<th>` and `<td>` for tables.
+- `<br>` for line breaks.
+
+Use headings, bold keywords, italic emphasis and underlining wherever they improve readability.
+
+---
+
+## 5. ALTERNATE ANSWERS – COMPULSORY
+
+Generate at least 2–3 meaningful alternate answer formats wherever applicable.
+
+These must be academically equivalent to the main answer but should demonstrate different presentation methods.
+
+### Alternative 1: Paragraph format
+
+Explain the concept in simple, connected paragraphs.
+
+### Alternative 2: Bullet-point format
+
+Present the same important concepts using short, clear bullet points.
+
+### Alternative 3: Tabular format
+
+Where appropriate, use comparison tables, classification tables, features, differences or advantages and disadvantages.
+
+### Alternative 4: Block diagram
+
+For system architecture, governance structures, security frameworks and relationships between components, provide a labelled block diagram.
+
+Example:
+
+```text
+Risk Identification
+        ↓
+Risk Assessment
+        ↓
+Risk Prioritization
+        ↓
+Risk Treatment
+        ↓
+Monitoring and Review
+```
+
+### Alternative 5: Flowchart
+
+For processes and procedures, provide a logical sequence of steps using arrows and decision points wherever applicable.
+
+### Alternative 6: Practical example
+
+Explain the concept using a simple organizational, business, cybersecurity or relevant subject-specific example.
+
+### Alternative 7: Short conceptual answer
+
+Provide another valid way of expressing the concept using essential keywords and brief explanations.
+
+### Important rules
+
+- Do not force all formats into every question.
+- Choose formats according to the subject and question.
+- Ensure diagrams have meaningful labels and logical connections.
+- Accept equivalent diagrams even if their visual arrangement differs.
+- Ensure all alternate answers contain valid concepts.
+- Do not treat the main answer as the only acceptable answer.
+- Every valid alternate presentation must be recognised by the marking rubrics.
+
+**A student writing the correct concept in a table, paragraph, bullet points or labelled diagram must be eligible for the same marks.**
+
+---
+
+## 6. AI-FRIENDLY MARKING RUBRICS – HIGHEST PRIORITY
+
+The university uses AI-based answer-sheet checking.
+
+Therefore, marking rubrics must be designed to recognise concepts, keywords, explanations, examples and alternate presentations rather than matching exact sentences.
+
+### A. Mandatory language-tolerance instruction
+
+Every single rubric row must include the following instruction in its Expected Evidence:
+
+**Do not deduct marks for grammar, spelling, punctuation, syntax, sentence construction, minor language mistakes or imperfect English. Evaluate only the student's conceptual understanding, relevant keywords, technical accuracy and correctness of the explanation. Award appropriate marks for correct concepts even when expressed in simple, brief or imperfect language.**
+
+This instruction must be present in every rubric row, not merely in a general instruction outside the rubric.
+
+### B. Liberal marking policy
+
+The rubrics must instruct the AI evaluator to:
+
+1. Award generous partial credit for every correct concept.
+2. Recognise relevant keywords even if explanations are brief.
+3. Accept equivalent terminology.
+4. Accept explanations written in students' own words.
+5. Accept bullet points, paragraphs and tables.
+6. Accept correctly labelled diagrams and flowcharts.
+7. Award marks for relevant practical examples.
+8. Recognise correct concepts even when the student does not reproduce the model answer.
+9. Avoid demanding identical sentence structures.
+10. Avoid deducting marks twice for the same missing concept.
+11. Give partial marks for incomplete but relevant understanding.
+12. Award the highest justified marks when the essential concepts are demonstrated.
+
+Do not award marks for irrelevant or factually incorrect statements merely to increase scores.
+
+### C. Keyword-based evaluation
+
+Include relevant keywords in the Expected Evidence of each rubric.
+
+For example, for Risk Mitigation:
+
+- Risk identification.
+- Risk assessment.
+- Risk reduction.
+- Preventive controls.
+- Corrective controls.
+- Security policies.
+- Monitoring.
+- Risk treatment.
+
+If a student uses an equivalent expression that demonstrates the same concept, award appropriate marks.
+
+Do not insist that every keyword must appear if the concept has otherwise been explained correctly.
+
+### D. Diagram recognition
+
+Where applicable, award marks for:
+
+- Correct components.
+- Correct labels.
+- Correct sequence.
+- Appropriate arrows.
+- Logical relationships.
+- Correct flow of information.
+- Relevant supporting explanation.
+
+A correctly drawn and labelled diagram must receive appropriate marks even if the student provides a shorter written explanation.
+
+### E. Fractional marks
+
+Use fractional marks wherever appropriate.
+
+Permitted examples:
+
+- 0.25
+- 0.50
+- 0.75
+- 1.00
+- 1.25
+- 1.50
+- 2.00
+- 2.50
+
+Do not restrict the rubric to whole numbers.
+
+### F. Total marks must match exactly
+
+The sum of all rubric rows must equal the original question marks.
+
+Examples:
+
+| Question marks | Example rubric total |
+|---|---:|
+| 1 | 1.00 |
+| 4 | 4.00 |
+| 6 | 6.00 |
+| 8 | 8.00 |
+
+Never generate a rubric whose total exceeds or falls below the question marks.
+
+### G. Topic-specific rubrics
+
+Never blindly reuse identical rubrics for all questions.
+
+Prepare criteria according to the actual question.
+
+Each rubric must contain:
+
+- `criterion`
+- `expectedEvidence`
+- `marks`
+
+The Expected Evidence must cover the main answer, alternate answers, relevant keywords and acceptable diagrams or tables.
+
+---
+
+## 7. STRICT JAVASCRIPT DATA FORMAT – VERSION 8.3 COMPATIBILITY
+
+**THIS SECTION IS THE AUTHORITATIVE DATA SCHEMA.**
+
+The generated JavaScript MUST follow the exact structure below.
+
+Do not invent, rename or add properties to the question objects.
+
+Do not replace the structure with a different JSON format.
+
+The output must be compatible with the existing Version 8.3 automation engine.
+
+### A. Question data structure
+
+```javascript
+window.questionData = [
+  {
+    "questionId": "REPLACE_WITH_EXISTING_QUESTION_ID",
+
+    "questionType": "Regular",
+    "marks": 4,
+    "difficulty": "Medium",
+
+    "module": {
+      "text": "EXACT MODULE LABEL FROM THE PORTAL DROPDOWN"
+    },
+
+    "topics": [
+      {
+        "text": "EXACT TOPIC LABEL 1"
+      },
+      {
+        "text": "EXACT TOPIC LABEL 2"
+      }
+    ],
+
+    "courseOutcome": "CO3",
+    "bloomsTaxonomy": "Apply",
+
+    "question": "<p>Write the updated question prompt here.</p>",
+
+    "answer": "<p>Write the expected answer or solution key here.</p>",
+
+    "alternateAnswers": [
+      "<p>Alternative acceptable answer 1.</p>",
+      "<p>Alternative acceptable answer 2.</p>",
+      "<p>Alternative acceptable answer 3.</p>"
+    ],
+
+    "rubric": [
+      {
+        "criterion": "Criterion 1",
+        "expectedEvidence": "Describe the evidence required for this criterion. Include keywords, equivalent explanations, alternate formats and the mandatory language-tolerance instruction.",
+        "marks": 2
+      },
+      {
+        "criterion": "Criterion 2",
+        "expectedEvidence": "Describe the evidence required for this criterion. Include keywords, equivalent explanations, alternate formats and the mandatory language-tolerance instruction.",
+        "marks": 2
+      }
+    ]
+  }
+];
+```
+
+### B. Exact field requirements
+
+| Field | Required structure | Important rule |
+|---|---|---|
+| questionId | String | Existing Question ID |
+| questionType | String | Preserve supplied type |
+| marks | Number | 1, 4, 6 or 8, as supplied |
+| difficulty | String | High, Medium or Low |
+| module | Object with `text` | Only ONE module |
+| topics | Array of objects with `text` | Multiple topics allowed |
+| courseOutcome | String | Preserve CO value |
+| bloomsTaxonomy | String | Preserve assigned level |
+| question | HTML string | Updated question only |
+| answer | HTML string | Detailed main answer |
+| alternateAnswers | Array of strings | Multiple acceptable answers |
+| rubric | Array of objects | Criterion, expectedEvidence and marks |
+
+### C. Module selection
+
+The portal allows only ONE module per question.
+
+Therefore:
+
+```javascript
+"module": {
+  "text": "Fundamentals of Cyber Space (Theory)"
+}
+```
+
+Never create multiple modules in the same record.
+
+### D. Multiple topic selection
+
+The portal allows MULTIPLE topics per question.
+
+Therefore, use:
+
+```javascript
+"topics": [
+  {
+    "text": "Regulation of cyber space"
+  },
+  {
+    "text": "Cyber security policies"
+  },
+  {
+    "text": "Cyber security standards"
+  }
+]
+```
+
+Rules:
+
+1. Every topic must be an object containing `text`.
+2. Use exact portal topic labels whenever available.
+3. Do not split a topic merely because its name contains a comma.
+4. Include only topics genuinely relevant to the question.
+5. Do not select unrelated topics.
+6. Use the exact labels or option IDs supplied by the user.
+
+### E. Omit unchanged fields
+
+If I explicitly request that a portal field should remain unchanged, omit that field from the record.
+
+Do not create empty values or guess a replacement.
+
+### F. Alternate answers structure
+
+`alternateAnswers` must always be an array of strings.
+
+Use HTML inside individual strings when useful.
+
+For example:
+
+```javascript
+"alternateAnswers": [
+  "<p><strong>Paragraph approach:</strong> ...</p>",
+  "<ul><li>Point one</li><li>Point two</li></ul>",
+  "<p><strong>Diagram approach:</strong></p><p>Identification → Assessment → Treatment → Monitoring</p>",
+  "<table><tr><th>Concept</th><th>Explanation</th></tr><tr><td>Risk</td><td>Possibility of loss</td></tr></table>"
+]
+```
+
+Do not create separate alternate-answer properties for paragraphs, diagrams or tables.
+
+### G. Rubric structure
+
+Use exactly:
+
+```javascript
+"rubric": [
+  {
+    "criterion": "Concept and definition",
+    "expectedEvidence": "Correct definition, relevant keywords and equivalent explanations. Accept brief answers and different presentation formats. Do not deduct marks for grammar, spelling, syntax or punctuation. Award generous partial credit for correct conceptual understanding.",
+    "marks": 1.00
+  },
+  {
+    "criterion": "Explanation and important features",
+    "expectedEvidence": "Recognizes the main features and their correct explanation. Accept bullets, paragraphs, tables, labelled diagrams and equivalent terminology. Do not deduct marks for grammar, spelling, syntax or punctuation. Award generous partial credit.",
+    "marks": 1.50
+  },
+  {
+    "criterion": "Example and application",
+    "expectedEvidence": "Relevant practical example or correct application of the concept. Accept equivalent examples and short explanations. Do not deduct marks for grammar, spelling, syntax or punctuation. Award generous partial credit.",
+    "marks": 1.50
+  }
+]
+```
+
+The example is illustrative. Create the actual criteria according to each question.
+
+---
+
+## 8. MANDATORY STORAGE CODE – DO NOT OMIT
+
+After the question-data array, include this storage and validation code.
+
+Preserve the exact storage key used by the supplied Version 8.3 template.
+
+```javascript
+try {
+    localStorage.setItem(
+        "__MU_MARWADI_QB_DATA_V7__",
+        JSON.stringify(window.questionData)
+    );
+
+    console.log(
+        "MU QB v8.3: " + window.questionData.length +
+        " question record(s) stored. Ready for Start / Resume."
+    );
+
+    console.table(window.questionData.map(q => ({
+        questionId: q.questionId,
+        marks: q.marks,
+        rubricTotal: q.rubric.reduce(
+            (sum, row) => sum + Number(row.marks),
+            0
+        ),
+        difficulty: q.difficulty,
+        bloomsTaxonomy: q.bloomsTaxonomy,
+        module: q.module?.text,
+        topics: q.topics?.map(t => t.text).join(", ")
+    })));
+
+} catch (error) {
+    console.error("MU QB data storage failed:", error);
+    alert("Could not store question data: " + (error.message || error));
+}
+```
+
+Do not change the storage key unless I provide a different key from the installed automation engine.
+
+---
+
+## 9. AUTOMATIC VALIDATION BEFORE DELIVERY
+
+Before generating the final JavaScript file, verify every record.
+
+### Question validation
+
+- Every supplied Question ID is included.
+- No duplicate Question IDs.
+- No missing records.
+- Correct question type.
+- Correct marks.
+- Correct difficulty.
+- Correct CO.
+- Correct Bloom's level.
+- Correct module object.
+- Correct topics array.
+
+### Answer validation
+
+- Updated question has an appropriate Bloom's action verb.
+- Main answer is accurate and sufficiently detailed.
+- Main answer is appropriate for the allocated marks.
+- Alternate answers are meaningfully different.
+- Paragraph, bullet, table and diagram alternatives are included wherever appropriate.
+- No contradictions exist between the main and alternate answers.
+
+### Rubric validation
+
+- All major concepts are covered.
+- Keywords are explicitly included.
+- Alternate presentations are recognised.
+- Language-tolerance instruction appears in every rubric row.
+- Fractional marks are valid.
+- Rubric totals exactly match question marks.
+- No marks are unnecessarily allocated to grammar or spelling.
+
+### JavaScript validation
+
+- Correct `window.questionData` declaration.
+- Correct object structure.
+- Correct property names.
+- Double quotes used properly.
+- No missing commas.
+- No trailing commas.
+- No unescaped quotation marks.
+- No missing brackets.
+- No undefined values.
+- No duplicate IDs.
+- Storage code included.
+- JavaScript syntax checked.
+
+Do not claim that the university portal has been tested unless actual testing has been performed.
+
+---
+
+## 10. FILE NAMING CONVENTION
+
+Generate the file using:
+
+`SHORTSUBJECT_FIRSTQUESTIONID_to_LASTQUESTIONID.js`
+
+Examples:
+
+- `GRC_449575_to_449222.js`
+- `CSS_461150_to_461100.js`
+- `CYS_463297_to_463110.js`
+
+Use the actual subject abbreviation and the first and last Question IDs in the supplied order.
+
+Do not sort IDs unless explicitly instructed.
+
+When I request a ZIP, include the generated JavaScript file in the ZIP.
+
+Do not include unrelated files or automation engines.
+
+---
+
+## 11. FINAL DELIVERY
+
+Provide:
+
+1. Downloadable JavaScript file.
+2. ZIP file if requested.
+3. Total number of question records.
+4. Starting Question ID.
+5. Ending Question ID.
+6. Distribution of 1-, 4-, 6- and 8-mark questions.
+7. Confirmation of rubric-total validation.
+8. Confirmation of JavaScript syntax validation.
+
+The complete question-data file must be ready to execute in Chrome DevTools → Sources → Snippets, or in the appropriate browser Console.
+
+---
+
+# 12. PASTE QUESTION IDS HERE
+
+**Subject Name:** [Enter subject name]
+
+**Subject Short Name:** [Enter short name]
+
+**Question Data:**
+
+| Question ID | Question Type | Marks | Difficulty | CO | Bloom's Taxonomy | Module Name | Topic | Old Question |
+|---|---|---:|---|---|---|---|---|---|
+| PASTE YOUR QUESTION RECORDS HERE | | | | | | | | |
+
+**Additional instructions (optional):**
+
+[Enter any special requirements here.]
+
+**Existing JavaScript sample or template (if available):**
+
+[Attach or paste the existing template if the schema has changed.]
+
+---
+
+## FINAL NON-NEGOTIABLE INSTRUCTION
+
+Generate all supplied questions using the exact Version 8.3 JavaScript schema.
+
+Do not change the structure of `window.questionData`.
+
+Use:
+- One module object with `text`.
+- A topics array containing objects with `text`.
+- One HTML-string question.
+- One HTML-string main answer.
+- An array of alternate-answer strings.
+- A rubric array containing `criterion`, `expectedEvidence` and numeric `marks`.
+
+The main answer must be detailed and student-friendly. Alternate answers must demonstrate different valid presentation formats. The rubrics must recognise all academically correct approaches.
+
+Every rubric row must explicitly instruct the AI evaluator not to deduct marks for grammar, spelling, punctuation, syntax or minor language mistakes.
+
+Use generous, concept-based partial marking, including fractional marks, while maintaining academic accuracy.
+
+**The total rubric marks must always equal the original question marks exactly.**
+
+Generate the complete executable JavaScript file, including the mandatory storage code, without changing the supplied automation schema.
