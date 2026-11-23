@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Marwadi University Question Bank — Auto Resume Updater
 // @namespace    MU-QuestionBank-Automation
-// @version      8.4.1
-// @description  JSON-driven updater with persistent lock-banner filtering, answer/rubric-only saves, and automatic 10-second refresh recovery when a confirmed success popup will not close.
+// @version      8.4.2
+// @description  JSON-driven updater; appends alternate acceptable answers to the same Expected Answer CKEditor field; retains auto-resume, rubric and popup recovery.
 // @match        https://academic.marwadiuniversity.ac.in:553/ManageQuestionBank.aspx*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -1915,8 +1915,7 @@
     function findOptionalField(fieldKey) {
         const modal = modalElement() || D;
         const patterns = {
-            questionType: /(question.?type|que.?type)/i,
-            alternateAnswers: /(alternate.?answers?|alternative.?answers?)/i
+            questionType: /(question.?type|que.?type)/i
         };
         const pattern = patterns[fieldKey];
         if (!pattern) return null;
@@ -1988,10 +1987,6 @@
 
         if (item.questionTypeProvided) {
             await setOptionalFieldFromJson(item, "questionType", "Question Type", item.questionType?.raw);
-        }
-        if (isRestrictedQuestion(item)) return;
-        if (item.alternateAnswersProvided) {
-            await setOptionalFieldFromJson(item, "alternateAnswers", "Alternate Answers", item.alternateAnswers);
         }
         if (isRestrictedQuestion(item)) return;
         if (item.answerReferenceMediaProvided) {
@@ -2119,6 +2114,42 @@
             setControl(controlInCell(cells[1]), rubric.expectedEvidence, "Expected Evidence row " + (index + 1));
             setControl(controlInCell(cells[2]), rubric.marks, "Marks row " + (index + 1));
         });
+    }
+
+    // Build the complete Expected Answer for the portal's single CKEditor field.
+    // The university form has no separate Alternate Answers control, so all
+    // alternate acceptable answers are appended to the main answer here.
+    function buildExpectedAnswerHtml(item) {
+        const mainAnswer = String(item.answer ?? "");
+        const rawAlternatives = Array.isArray(item.alternateAnswers)
+            ? item.alternateAnswers
+            : (item.alternateAnswers == null ? [] : [item.alternateAnswers]);
+
+        const alternatives = rawAlternatives
+            .map(value => String(value ?? "").trim())
+            .filter(Boolean);
+
+        if (!alternatives.length) return mainAnswer;
+
+        // Alternate answers are treated as plain text and HTML-escaped so
+        // special characters cannot break the CKEditor document structure.
+        const escapeHtml = value => String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+
+        const alternateItems = alternatives.map(value => {
+            const safeText = escapeHtml(value).replace(/\r\n|\r|\n/g, "<br>");
+            return "<li>" + safeText + "</li>";
+        }).join("\n");
+
+        return mainAnswer +
+            "\n<hr>\n" +
+            "<h3>Alternative Acceptable Answers</h3>\n" +
+            "<p>The following answers are also acceptable:</p>\n" +
+            "<ol>\n" + alternateItems + "\n</ol>";
     }
 
     async function setEditorHtml(editorId, html, label) {
@@ -2354,7 +2385,7 @@
                     // and does NOT write Question Prompt or any other field.
                     await ensureRubricRowCount(item.rubric.length, item.questionId);
                     populateRubrics(item.rubric, item.questionId);
-                    await setEditorHtml(IDS.answerEditor, item.answer, "Expected Answer");
+                    await setEditorHtml(IDS.answerEditor, buildExpectedAnswerHtml(item), "Expected Answer");
 
                     if (currentFormQuestionId() !== item.questionId) {
                         throw new Error("Restricted retry final identity check failed for Question ID " + item.questionId + ".");
@@ -2407,7 +2438,7 @@
                 if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
                     continue;
                 }
-                await setEditorHtml(IDS.answerEditor, item.answer, "Expected Answer");
+                await setEditorHtml(IDS.answerEditor, buildExpectedAnswerHtml(item), "Expected Answer");
 
                 handleQuestionPaperLockNotice();
                 latestState = readState();
@@ -2915,5 +2946,5 @@
         onReady();
     }
 
-    console.info("[MU QB] Version 8.4.0 loaded (JSON-driven metadata; multi-topic; replace-all rubrics; persistent question-paper banner ignored during answer/rubric-only save; genuine server alerts retained; server-response-only recovery).");
+    console.info("[MU QB] Version 8.4.2 loaded (alternate acceptable answers appended in the same Expected Answer CKEditor; JSON-driven metadata; multi-topic; replace-all rubrics; question-paper answer/rubric-only mode; automatic success-popup recovery).");
 })();
