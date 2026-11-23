@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Marwadi University Question Bank — Auto Resume Updater
 // @namespace    MU-QuestionBank-Automation
-// @version      7.4.0
-// @description  Mark-aware question updater with three-attempt recovery for one-mark dropdown errors and automatic skip logging.
+// @version      8.4.1
+// @description  JSON-driven updater with persistent lock-banner filtering, answer/rubric-only saves, and automatic 10-second refresh recovery when a confirmed success popup will not close.
 // @match        https://academic.marwadiuniversity.ac.in:553/ManageQuestionBank.aspx*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -28,12 +28,19 @@
         hiddenQuestionId: "ctl00_ContentPlaceHolder1_HFQuestionBankID",
         questionEditor: "ctl00_ContentPlaceHolder1_ckQuestion",
         answerEditor: "ctl00_ContentPlaceHolder1_ckAnswer",
+        marks: "ctl00_ContentPlaceHolder1_drpQuestionMarks",
+        difficulty: "ctl00_ContentPlaceHolder1_cmbQueLevel",
+        module: "ctl00_ContentPlaceHolder1_cmbSyllabusModule",
+        topics: "ctl00_ContentPlaceHolder1_lstSyllabusTopic",
+        courseOutcome: "ctl00_ContentPlaceHolder1_drpCO",
+        bloomsTaxonomy: "ctl00_ContentPlaceHolder1_drpBloomsTaxonomy",
         rubricTable: "tblRubrics",
         addRubric: "ctl00_ContentPlaceHolder1_btnAddRubricRow",
         saveButton: "ctl00_ContentPlaceHolder1_btnSave"
     };
 
     const SUCCESS_TEXT = /record\s+update\s+successfully|record\s+updated\s+successfully|question\s+updated\s+successfully|update\s+successful|successfully\s+updated|saved\s+successfully/i;
+    const QUESTION_PAPER_LOCK_TEXT = /question[\s\S]{0,80}already[\s\S]{0,80}asked[\s\S]{0,80}question\s+paper[\s\S]{0,100}(?:can\s*not|cannot|can't)[\s\S]{0,30}edit/i;
 
     // Recovery is deliberately bounded. A failed question is retried from the
     // beginning of that same question; completed question IDs are never replayed.
@@ -50,7 +57,12 @@
         elementTimeoutMs: 45000,
         openFormTimeoutMs: 60000,
         successTimeoutMs: 90000,
-        popupCloseTimeoutMs: 20000
+        popupCloseTimeoutMs: 20000,
+        // If the university has already displayed its success confirmation but
+        // the OK dialog refuses to close, wait 10 seconds and reload into the
+        // saved "advance" stage. The successful save is NOT submitted again.
+        successPopupStuckRefreshDelayMs: 10000,
+        successPopupStuckMaxRefreshes: 2
     });
 
     const sleep = ms => new Promise(resolve => W.setTimeout(resolve, ms));
@@ -62,6 +74,7 @@
     let recoveryTimer = null;
     let popupClickBusy = false;
     let popupClickAttempts = 0;
+    let rubricDeleteInProgress = false;
 
     function readState() {
         try {
@@ -102,10 +115,12 @@
     function updateSkipButton() {
         if (!ui?.skip) return;
         const state = readState();
-        const diagnostic = [state?.status, state?.lastError, state?.lastPageAlert].filter(Boolean).join("\n");
+        // Any error that pauses on a concrete current Question ID can be
+        // manually skipped. Batch/data errors without a current ID remain
+        // non-skippable so the user cannot accidentally skip an unknown row.
         const canSkip = !!state && !state.running && state.stage === "error" &&
-            !!state.currentQuestionId && Number.isInteger(Number(state.index)) &&
-            state.index >= 0 && isMarksDropdownMismatch(diagnostic);
+            !!String(state.currentQuestionId || "").trim() &&
+            Number.isInteger(Number(state.index)) && state.index >= 0;
         ui.skip.hidden = !canSkip;
         ui.skip.disabled = !canSkip;
     }
@@ -142,12 +157,85 @@
             /safety (?:check|stop).*failed/i,
             /refusing to edit the wrong record/i,
             /different existing question is already open/i,
-            /currently has \d+ rubric rows but the data file has/i,
-            /will not delete existing rubric rows/i,
+            /DATA\/PORTAL FIELD ERROR/i,
             /unknown automation stage/i,
             /progress belongs to a different batch|question batch does not match|cannot safely match legacy progress/i,
             /unauthorized|access denied|permission denied/i
         ].some(pattern => pattern.test(text));
+    }
+
+    function isRetryableServerFailure(message) {
+        const text = String(message || "");
+        return [
+            /did not finish after \d+ seconds.*server\/page may be busy or unresponsive/i,
+            /PageRequestManagerServerErrorException/i,
+            /HTTP\s*(?:500|502|503|504)\b/i,
+            /internal server error|service unavailable|bad gateway|gateway timeout/i,
+            /failed to fetch|networkerror|connection (?:reset|closed|refused)|ERR_(?:CONNECTION|NETWORK|TIMED_OUT)/i,
+            /request timed out|server response timed out|server is not responding/i,
+            /timed out waiting for (?:Question Bank grid page|Edit form for Question ID|new rubric row for Question ID|existing rubric row removal for Question ID|module and topic options after module change|success popup and automatic OK click for Question ID)/i
+        ].some(pattern => pattern.test(text));
+    }
+
+    function isQuestionPaperLockedMessage(message) {
+        const text = String(message || "").replace(/\s+/g, " ").trim();
+        return QUESTION_PAPER_LOCK_TEXT.test(text) ||
+            /question.*already.*asked.*question paper.*(?:cannot|can\s*not|can't).*edit/i.test(text);
+    }
+
+    // The portal blocks prompt/metadata edits once a question has appeared in a
+    // question paper. In that case, retry the same record in answer+rubric-only
+    // mode. If the portal rejects that restricted retry too, pause safely.
+    function markQuestionPaperLocked(state, message, source) {
+        if (!state || !state.running) return false;
+        const questionId = String(state.currentQuestionId || "").trim();
+        if (!questionId) return false;
+
+        const reason = String(message || "The question has already been asked in a question paper.");
+        const alreadyRestricted = String(state.restrictedModeQuestionId || "") === questionId;
+        const restrictedSaveInProgress = alreadyRestricted && state.stage === "saving" &&
+            state.saveMode === "answers_rubrics";
+
+        if (restrictedSaveInProgress) {
+            state.running = false;
+            state.stage = "error";
+            state.resumeStage = "restricted_prepare";
+            state.recoveryPending = false;
+            state.lastPageAlert = null;
+            state.lastError = "The portal repeated its question-paper edit restriction during the answer/rubric-only retry: " + reason;
+            state.status = "ERROR: Question ID " + questionId +
+                " was also rejected when only Expected Answer and Rubrics were being updated." +
+                "\nNo further automatic save was attempted. Check whether the portal permits answer/rubric edits for this record." +
+                "\nIf you want the batch to continue without changing this question, click Skip this ID and continue.";
+            writeState(state);
+            setStatus(state.status);
+            setPanelRunning(false);
+            return true;
+        }
+
+        if (!Array.isArray(state.restrictedQuestionIds)) state.restrictedQuestionIds = [];
+        if (!state.restrictedQuestionIds.includes(questionId)) {
+            state.restrictedQuestionIds.push(questionId);
+        }
+        state.restrictedModeQuestionId = questionId;
+        state.stage = "restricted_prepare";
+        state.resumeStage = "restricted_prepare";
+        state.successPopupHandled = false;
+        state.recoveryPending = false;
+        state.lastPageAlert = null;
+        state.lastError = null;
+        state.status = "QUESTION-PAPER LOCK DETECTED: Question ID " + questionId +
+            " cannot have its prompt or metadata edited. Re-opening it and updating Expected Answer + Rubrics only.";
+        writeState(state);
+        setStatus(state.status);
+        console.warn("[MU QB] Question-paper lock detected; switching this ID to answer/rubric-only mode:", {
+            questionId, source: source || "unknown", message: reason
+        });
+        return true;
+    }
+
+    function isRestrictedQuestion(item, state = readState()) {
+        return !!state && String(state.restrictedModeQuestionId || "") === String(item?.questionId || "");
     }
 
     function addSkippedLogEntry(state, entry) {
@@ -209,7 +297,72 @@
         const shortError = String(error?.message || error || "Unknown automation error");
         const detail = String(error?.stack || shortError);
         const combinedError = shortError + " " + String(state.lastPageAlert || "");
-        const resumeStage = state.stage === "advance" ? "advance" : "prepare";
+
+        // A success popup has already been positively detected (stage="advance",
+        // successPopupHandled=true), so a timeout waiting for its OK dialog to
+        // disappear is a UI-dismissal problem, NOT a failed save. Preserve the
+        // advance stage, wait 10 seconds, reload, and continue with the NEXT ID.
+        // Never return to "prepare" or "restricted_prepare" here: that could
+        // submit the already-confirmed question a second time.
+        const successPopupCloseTimedOut =
+            state.stage === "advance" && state.successPopupHandled === true &&
+            /timed out waiting for success popup to close after automatic ok click/i.test(shortError);
+
+        if (successPopupCloseTimedOut) {
+            const refreshAttempts = Number(state.successPopupRecoveryRefreshCount || 0);
+            if (refreshAttempts >= RECOVERY.successPopupStuckMaxRefreshes) {
+                state.running = false;
+                state.stage = "error";
+                state.resumeStage = "advance";
+                state.recoveryPending = false;
+                state.lastError = detail;
+                state.status = "SAFE PAUSE: The success confirmation was detected for Question ID " +
+                    questionId + ", but the popup remained open after " + refreshAttempts +
+                    " automatic page refresh attempts." +
+                    "\nThe save will not be repeated. Progress is preserved at the confirmed-success stage." +
+                    "\nClose the portal dialog manually, then press Start / Resume. You may also use Skip this ID if necessary." +
+                    "\nSuccessfully updated: " + processed + " | Skipped: " + ((state.skippedIds || []).length);
+                writeState(state);
+                setStatus(state.status);
+                setPanelRunning(false);
+                console.error("[MU QB] Success popup remained stuck after automatic refresh attempts:", error);
+                return true;
+            }
+
+            state.successPopupRecoveryRefreshCount = refreshAttempts + 1;
+            state.running = true;
+            state.stage = "advance";
+            state.resumeStage = "advance";
+            state.successPopupHandled = true;
+            state.recoveryPending = true;
+            state.lastError = detail;
+            state.lastPageAlert = null;
+            state.resumeNotice = "The success confirmation for Question ID " + questionId +
+                " was already received. The popup did not close; continuing to the next question without resubmitting this ID.";
+            state.status = "SUCCESS CONFIRMED — POPUP DID NOT CLOSE: Question ID " + questionId +
+                " was confirmed by the portal." +
+                "\nWaiting 10 seconds, then automatically refreshing and continuing from the next question." +
+                "\nThe current question will NOT be submitted again." +
+                "\nAutomatic popup recovery refresh " + state.successPopupRecoveryRefreshCount + "/" +
+                RECOVERY.successPopupStuckMaxRefreshes +
+                " | Successfully updated: " + processed + " | Skipped: " + ((state.skippedIds || []).length);
+            writeState(state);
+            setStatus(state.status);
+            setProgress(state.index || 0, batch.length || 0);
+            setPanelRunning(true);
+            reloadForResume(RECOVERY.successPopupStuckRefreshDelayMs, questionId,
+                "Success was confirmed for Question ID " + questionId +
+                ". Refreshing in 10 seconds and continuing with the next question...");
+            console.warn("[MU QB] Confirmed-success popup did not close; scheduled safe advance refresh:", {
+                questionId,
+                refreshAttempt: state.successPopupRecoveryRefreshCount,
+                delayMs: RECOVERY.successPopupStuckRefreshDelayMs
+            });
+            return true;
+        }
+        const restrictedForCurrent = String(state.restrictedModeQuestionId || "") === questionId;
+        const resumeStage = state.stage === "advance" ? "advance" :
+            (restrictedForCurrent ? "restricted_prepare" : "prepare");
         const retryKey = questionId || ("index:" + state.index);
         const processed = Array.isArray(state.completedIds) ? state.completedIds.length : 0;
 
@@ -231,8 +384,8 @@
                 state.retryCount = attempt;
                 state.lastError = detail;
                 state.lastPageAlert = null;
-                state.stage = "prepare";
-                state.resumeStage = "prepare";
+                state.stage = resumeStage;
+                state.resumeStage = resumeStage;
                 state.successPopupHandled = false;
                 state.recoveryPending = true;
 
@@ -271,6 +424,8 @@
                 });
                 state.index += 1;
                 state.currentQuestionId = null;
+                state.restrictedModeQuestionId = null;
+                state.saveMode = null;
                 state.retryQuestionId = null;
                 state.retryCount = 0;
                 state.running = true;
@@ -323,12 +478,32 @@
                 state.status = "ERROR: " + shortError +
                     "\nID: " + (questionId || "not set") +
                     " | Processed: " + processed +
-                    "\nAutomatic retry was not attempted because this appears to be a data, validation, permission, or safety issue. Correct it and press Start / Resume.";
+                    "\nAutomatic retry was not attempted because this appears to be a data, validation, permission, or safety issue. Correct it and press Start / Resume." +
+                    "\nIf you want to leave this question unchanged and continue, click Skip this ID and continue.";
             }
             writeState(state);
             setStatus(state.status);
             setPanelRunning(false);
             console.error("[MU QB] Manual intervention required:", error);
+            return true;
+        }
+
+        if (!isRetryableServerFailure(combinedError)) {
+            state.running = false;
+            state.stage = "error";
+            state.resumeStage = resumeStage;
+            state.recoveryPending = false;
+            state.lastError = detail;
+            state.status = "SAFE PAUSE: " + shortError +
+                "\nQuestion ID: " + (questionId || "not set") +
+                "\nNo automatic refresh was attempted because this was not identified as a server-response failure." +
+                "\nCorrect the data or portal-field issue, then press Start / Resume. The same question is preserved." +
+                "\nIf you want to leave this question unchanged and continue, click Skip this ID and continue." +
+                "\nSuccessfully updated: " + processed + " | Skipped: " + ((state.skippedIds || []).length);
+            writeState(state);
+            setStatus(state.status);
+            setPanelRunning(false);
+            console.warn("[MU QB] Paused without refresh; error was not classified as a server response:", error);
             return true;
         }
 
@@ -348,7 +523,7 @@
                 (questionId || "unknown") + "." +
                 "\nLast issue: " + shortError +
                 "\nProcessed: " + processed +
-                "\nThe batch is safely paused. Press Start / Resume to try this same question again.";
+                "\nThe batch is safely paused. Press Start / Resume to try this same question again, or click Skip this ID and continue to leave it unchanged.";
             writeState(state);
             setStatus(state.status);
             setPanelRunning(false);
@@ -418,6 +593,27 @@
         return validateBatch(JSON.parse(raw));
     }
 
+    function hasAnyKey(object, keys) {
+        return keys.some(key => Object.prototype.hasOwnProperty.call(object, key));
+    }
+
+    function normalizeChoice(raw) {
+        if (raw == null || raw === "") return null;
+        if (typeof raw === "object" && !Array.isArray(raw)) {
+            const value = raw.value ?? raw.id ?? raw.code ?? raw.optionValue ?? "";
+            const text = raw.text ?? raw.name ?? raw.label ?? raw.title ?? raw.code ?? "";
+            return {
+                raw,
+                value: String(value).trim(),
+                text: String(text).trim(),
+                index: raw.index == null && raw.optionIndex == null
+                    ? null : Number(raw.index ?? raw.optionIndex)
+            };
+        }
+        const value = String(raw).trim();
+        return { raw, value, text: value, index: null };
+    }
+
     function validateBatch(raw) {
         if (!Array.isArray(raw) || !raw.length) {
             throw new Error("Question data must be a non-empty array.");
@@ -464,10 +660,9 @@
                 marks: Number(row.marks)
             }));
 
-            // Question-level marks are metadata from the data file. A value of 1
-            // is valid (for example, a one-mark MCQ) and is not a reason to reject
-            // the record. This script does not force the portal's server dropdown.
-            const marks = item.marks == null || item.marks === "" ? null : Number(item.marks);
+            const marksProvided = Object.prototype.hasOwnProperty.call(item, "marks") &&
+                item.marks != null && item.marks !== "";
+            const marks = marksProvided ? Number(item.marks) : null;
             if (marks !== null && (!Number.isInteger(marks) || marks < 1)) {
                 throw new Error("Question ID " + questionId + " has invalid question-level marks: " + item.marks + ". Marks must be a positive whole number.");
             }
@@ -479,33 +674,108 @@
                 }
             }
 
+            const moduleRaw = item.module ?? item.moduleName ?? item.moduleId ?? null;
+            const moduleProvided = hasAnyKey(item, ["module", "moduleName", "moduleId"]) &&
+                moduleRaw != null && moduleRaw !== "";
+            const topicsRaw = item.topics ?? item.topicNames ?? item.topicIds ?? item.topic ?? null;
+            const topicsProvided = hasAnyKey(item, ["topics", "topicNames", "topicIds", "topic"]) &&
+                topicsRaw != null && topicsRaw !== "";
+            if (topicsProvided && topicsRaw != null &&
+                typeof topicsRaw !== "string" && !Array.isArray(topicsRaw)) {
+                throw new Error("DATA/PORTAL FIELD ERROR: Question ID " + questionId +
+                    " has topics in an unsupported format. Use an array of topic names/IDs or a legacy string.");
+            }
+            if (Array.isArray(topicsRaw) && topicsRaw.some(topic =>
+                topic == null || (typeof topic !== "string" && typeof topic !== "number" &&
+                (typeof topic !== "object" || Array.isArray(topic))))) {
+                throw new Error("DATA/PORTAL FIELD ERROR: Question ID " + questionId +
+                    " has an invalid topic item. Use strings, numeric IDs, or {value,text} objects.");
+            }
+
+            const difficultyRaw = item.difficulty ?? item.questionLevel ?? null;
+            const coRaw = item.courseOutcome ?? item.co ?? item.courseOutcomeId ?? null;
+            const bloomRaw = item.bloomsTaxonomy ?? item.bloomTaxonomy ?? item.bloom ?? null;
+            const questionTypeRaw = item.questionType ?? item.type ?? null;
+            const alternateRaw = item.alternateAnswers ?? item.alternativeAnswers ?? null;
+
             return {
                 questionId,
                 question,
                 answer,
                 rubric: normalizedRubric,
-                marks
+                marks,
+                marksProvided,
+                difficulty: normalizeChoice(difficultyRaw),
+                difficultyProvided: hasAnyKey(item, ["difficulty", "questionLevel"]) &&
+                    difficultyRaw != null && difficultyRaw !== "",
+                module: normalizeChoice(moduleRaw),
+                moduleProvided,
+                topics: topicsRaw,
+                topicsProvided,
+                topicsLegacyString: typeof topicsRaw === "string",
+                courseOutcome: normalizeChoice(coRaw),
+                courseOutcomeProvided: hasAnyKey(item, ["courseOutcome", "co", "courseOutcomeId"]) &&
+                    coRaw != null && coRaw !== "",
+                bloomsTaxonomy: normalizeChoice(bloomRaw),
+                bloomsProvided: hasAnyKey(item, ["bloomsTaxonomy", "bloomTaxonomy", "bloom"]) &&
+                    bloomRaw != null && bloomRaw !== "",
+                questionType: normalizeChoice(questionTypeRaw),
+                questionTypeProvided: hasAnyKey(item, ["questionType", "type"]) &&
+                    questionTypeRaw != null && questionTypeRaw !== "",
+                alternateAnswers: alternateRaw == null ? [] :
+                    (Array.isArray(alternateRaw) ? alternateRaw.map(String) : [String(alternateRaw)]),
+                alternateAnswersProvided: hasAnyKey(item, ["alternateAnswers", "alternativeAnswers"]) &&
+                    alternateRaw != null,
+                answerReferenceMediaProvided: hasAnyKey(item, ["answerReferenceMedia", "referenceMedia"]) &&
+                    (item.answerReferenceMedia ?? item.referenceMedia) != null
             };
         });
     }
 
-    function getBatchSignature(batch) {
-        // Keep the Version 7.2 signature shape for backward compatibility with
-        // saved progress. Question-level marks are validated separately and are
-        // not changed by this updater; the editable payload remains these fields.
-        const signaturePayload = batch.map(item => ({
-            questionId: item.questionId,
-            question: item.question,
-            answer: item.answer,
-            rubric: item.rubric
-        }));
+    function hashBatchPayload(signaturePayload, batchLength) {
         const serialized = JSON.stringify(signaturePayload);
         let hash = 2166136261;
         for (let index = 0; index < serialized.length; index++) {
             hash ^= serialized.charCodeAt(index);
             hash = Math.imul(hash, 16777619);
         }
-        return batch.length + ":" + (hash >>> 0).toString(16);
+        return batchLength + ":" + (hash >>> 0).toString(16);
+    }
+
+    function getLegacyBatchSignature(batch) {
+        return hashBatchPayload(batch.map(item => ({
+            questionId: item.questionId,
+            question: item.question,
+            answer: item.answer,
+            rubric: item.rubric
+        })), batch.length);
+    }
+
+    function getBatchSignature(batch) {
+        const signaturePayload = batch.map(item => ({
+            questionId: item.questionId,
+            question: item.question,
+            answer: item.answer,
+            rubric: item.rubric,
+            marks: item.marks,
+            marksProvided: item.marksProvided,
+            difficulty: item.difficulty,
+            difficultyProvided: item.difficultyProvided,
+            module: item.module,
+            moduleProvided: item.moduleProvided,
+            topics: item.topics,
+            topicsProvided: item.topicsProvided,
+            courseOutcome: item.courseOutcome,
+            courseOutcomeProvided: item.courseOutcomeProvided,
+            bloomsTaxonomy: item.bloomsTaxonomy,
+            bloomsProvided: item.bloomsProvided,
+            questionType: item.questionType,
+            questionTypeProvided: item.questionTypeProvided,
+            alternateAnswers: item.alternateAnswers,
+            alternateAnswersProvided: item.alternateAnswersProvided,
+            answerReferenceMediaProvided: item.answerReferenceMediaProvided
+        }));
+        return hashBatchPayload(signaturePayload, batch.length);
     }
 
     function assertBatchMatchesState(state, batch) {
@@ -524,7 +794,12 @@
         }
 
         if (state.batchSignature && state.batchSignature !== signature) {
-            throw new Error("The loaded question-data file does not match the saved progress. Restore the original batch to resume, or press Reset to start this batch from the beginning.");
+            if (state.batchSignature === getLegacyBatchSignature(batch)) {
+                state.batchSignature = signature;
+                writeState(state);
+            } else {
+                throw new Error("The loaded question-data file does not match the saved progress. Restore the original batch to resume, or press Reset to start this batch from the beginning.");
+            }
         }
 
         if (processed.some(id => !validIds.has(id)) ||
@@ -558,6 +833,11 @@
             value: function (message) {
                 const text = String(message ?? "");
                 const state = readState();
+
+                if (state?.running && isQuestionPaperLockedMessage(text)) {
+                    markQuestionPaperLocked(state, text, "window.alert");
+                    return;
+                }
 
                 if (state?.running && state.stage === "saving" && SUCCESS_TEXT.test(text)) {
                     state.stage = "advance";
@@ -606,6 +886,30 @@
         });
     } catch (error) {
         console.warn("[MU QB] Could not wrap window.alert:", error);
+    }
+
+    // Auto-confirm only a confirmation raised synchronously by a rubric-row
+    // remove action. All other page confirmations remain under the user's control.
+    try {
+        const originalConfirm = W.confirm.bind(W);
+        Object.defineProperty(W, "confirm", {
+            configurable: true,
+            writable: true,
+            value: function (message) {
+                const state = readState();
+                if (state?.running && isQuestionPaperLockedMessage(message)) {
+                    markQuestionPaperLocked(state, message, "window.confirm");
+                    return false;
+                }
+                if (rubricDeleteInProgress && state?.running) {
+                    console.info("[MU QB] Auto-confirmed rubric-row removal:", String(message || ""));
+                    return true;
+                }
+                return originalConfirm(message);
+            }
+        });
+    } catch (error) {
+        console.warn("[MU QB] Could not wrap window.confirm for rubric cleanup:", error);
     }
 
     // The supplied page loads SweetAlert. Its success popup is HTML, not
@@ -660,6 +964,101 @@
         }
         return null;
     }
+    function getQuestionPaperLockNotice(state = readState()) {
+        // IMPORTANT:
+        // Once a question is known to be locked, the portal keeps the red
+        // "already asked in question paper" text in the AddQuestion form title.
+        // That title is informational and remains visible while Expected Answer
+        // and Rubrics are edited. It must NOT be treated as a second rejection.
+        // Genuine server-side validation/alert elements are still inspected.
+        const questionId = String(state?.currentQuestionId || "").trim();
+        const alreadyRestricted = !!questionId &&
+            String(state?.restrictedModeQuestionId || "") === questionId;
+
+        const selectors = [
+            // Actual validation/alert elements inside the form remain actionable.
+            "#AddQuestion .validation-summary-errors",
+            "#AddQuestion .field-validation-error",
+            "#AddQuestion .alert",
+            "#AddQuestion [role='alert']",
+            // Portal-generated alert/dialog containers outside the form.
+            ".sweet-alert", ".swal-modal", ".swal2-popup", ".swal2-container",
+            ".bootbox", ".toast", ".alert", "[role='alert']",
+            "[role='alertdialog']", "[role='dialog']"
+        ];
+
+        // Inspect the form title/header only on the first, full-edit attempt.
+        // After lock detection, this same title is a persistent banner and is
+        // deliberately ignored during the answer/rubric-only retry.
+        if (!alreadyRestricted) {
+            selectors.push(
+                "#AddQuestion .modal-title",
+                "#AddQuestion .modal-header",
+                "#AddQuestion h1", "#AddQuestion h2", "#AddQuestion h3",
+                "#AddQuestion h4", "#AddQuestion h5", "#AddQuestion h6"
+            );
+        }
+
+        const seen = new Set();
+        for (const selector of selectors) {
+            for (const element of D.querySelectorAll(selector)) {
+                if (seen.has(element) || !isVisible(element)) continue;
+                seen.add(element);
+                const text = String(element.innerText || element.textContent || "")
+                    .replace(/\s+/g, " ").trim();
+                if (!isQuestionPaperLockedMessage(text)) continue;
+
+                // Defensive filter for the persistent title/banner in an
+                // already-restricted record. Do not suppress real validation
+                // summaries or alert elements; those were checked above.
+                if (alreadyRestricted && element.closest("#AddQuestion") &&
+                    !element.matches(
+                        ".validation-summary-errors, .field-validation-error, .alert, [role='alert']"
+                    )) {
+                    continue;
+                }
+                return { element, text };
+            }
+        }
+        return null;
+    }
+
+    function handleQuestionPaperLockNotice() {
+        const state = readState();
+        if (!state?.running || !state.currentQuestionId) return false;
+        if (!["prepare", "saving", "restricted_prepare"].includes(state.stage)) return false;
+
+        // A known lock banner is expected to remain visible during the restricted
+        // retry. getQuestionPaperLockNotice() ignores that persistent title, but
+        // continues to detect fresh validation summaries and actual alert dialogs.
+        const found = getQuestionPaperLockNotice(state);
+        if (!found) return false;
+
+        const handled = markQuestionPaperLocked(state, found.text, "visible portal message");
+        if (!handled) return false;
+
+        // If the portal uses an HTML alert instead of window.alert, dismiss only
+        // the OK/Close control inside the exact matching notice.
+        let container = found.element;
+        for (let depth = 0; container && depth < 6; depth++, container = container.parentElement) {
+            const button = Array.from(container.querySelectorAll(
+                "button, input[type='button'], input[type='submit'], a"
+            )).find(node => {
+                if (!isVisible(node) || node.disabled) return false;
+                const label = String(node.innerText || node.textContent || node.value ||
+                    node.getAttribute("aria-label") || node.title || "").replace(/\s+/g, " ").trim();
+                return /^(ok|okay|close|got it)$/i.test(label);
+            });
+            if (button) {
+                try { button.click(); } catch (error) {
+                    console.warn("[MU QB] Could not dismiss question-paper lock notice:", error);
+                }
+                break;
+            }
+        }
+        return true;
+    }
+
     function handleSuccessPopup() {
         const state = readState();
         if (!state?.running || !["saving", "advance"].includes(state.stage)) return;
@@ -711,18 +1110,22 @@
 
     function installSuccessPopupObserver() {
         if (successObserver || !D.documentElement) return;
-        successObserver = new W.MutationObserver(() => handleSuccessPopup());
+        successObserver = new W.MutationObserver(() => {
+            handleQuestionPaperLockNotice();
+            handleSuccessPopup();
+        });
         successObserver.observe(D.documentElement, {
             childList: true,
             subtree: true,
             attributes: true,
             attributeFilter: ["class", "style", "aria-hidden"]
         });
-        // Also check in case the popup was added before the observer.
+        // Also check in case a notice/popup was added before the observer.
+        handleQuestionPaperLockNotice();
         handleSuccessPopup();
     }
 
-    function waitFor(getter, label, timeout = RECOVERY.elementTimeoutMs) {
+    function waitFor(getter, label, timeout = RECOVERY.elementTimeoutMs, allowPaused = false) {
         return new Promise((resolve, reject) => {
             const started = Date.now();
             const poll = () => {
@@ -731,7 +1134,7 @@
                 if (result) return resolve(result);
 
                 const state = readState();
-                if (!state?.running) {
+                if (!state?.running && !allowPaused) {
                     return reject(new Error("Batch stopped while waiting for " + label + "."));
                 }
                 if (Date.now() - started > timeout) {
@@ -885,7 +1288,7 @@
             " was not found in any of the " + pagerInfo.count + " grid pages.");
     }
 
-    function hideAddQuestionModal() {
+    function hideAddQuestionModal(allowPaused = false) {
         const modal = modalElement();
         if (!modal || !modalIsVisible()) return Promise.resolve();
 
@@ -902,12 +1305,12 @@
         }
 
         return waitFor(() => !modalIsVisible(),
-            "Add Question form to close", RECOVERY.popupCloseTimeoutMs).then(() => {
+            "Add Question form to close", RECOVERY.popupCloseTimeoutMs, allowPaused).then(() => {
                 try { if (typeof W.HideModal === "function") W.HideModal(); } catch (_) {}
             });
     }
 
-    async function closeBlankAddQuestionFormIfNeeded() {
+    async function closeBlankAddQuestionFormIfNeeded(allowPaused = false) {
         if (!modalIsVisible() || !isBlankAddQuestionForm()) return;
 
         const modal = modalElement();
@@ -939,12 +1342,12 @@
 
         try {
             await waitFor(() => !modalIsVisible(),
-                "blank Add New Question form to close using Cancel", 15000);
+                "blank Add New Question form to close using Cancel", 15000, allowPaused);
         } catch (firstError) {
             if (W.jQuery && W.jQuery.fn && typeof W.jQuery.fn.modal === "function") {
                 W.jQuery(modal).modal("hide");
                 await waitFor(() => !modalIsVisible(),
-                    "blank Add New Question form to close", 15000);
+                    "blank Add New Question form to close", 15000, allowPaused);
             } else {
                 throw new Error(
                     "Could not close the blank Add New Question form. Cancel click did not hide it. " +
@@ -953,6 +1356,17 @@
             }
         }
         await sleep(250);
+    }
+
+    async function waitForPagePostbackIdle(label = "page postback to finish", allowPaused = false) {
+        const prm = W.Sys?.WebForms?.PageRequestManager?.getInstance?.();
+        if (!prm || typeof prm.get_isInAsyncPostBack !== "function") return;
+        await waitFor(
+            () => !prm.get_isInAsyncPostBack(),
+            label,
+            RECOVERY.postbackTimeoutMs,
+            allowPaused
+        );
     }
 
     function runPartialPostback(action, label, timeout = RECOVERY.postbackTimeoutMs) {
@@ -978,7 +1392,8 @@
                 const error = args?.get_error?.();
                 if (error) {
                     try { args?.set_errorHandled?.(true); } catch (_) {}
-                    reject(new Error(label + " failed: " + (error.message || error)));
+                    reject(new Error(label + " failed: " +
+                        ((error.name ? error.name + ": " : "") + (error.message || error))));
                 }
                 else resolve();
             };
@@ -1001,6 +1416,26 @@
                 }
             }
         });
+    }
+
+    async function reopenExistingQuestionForRestrictedRetry(questionId) {
+        await waitForPagePostbackIdle("question-paper restriction response to finish");
+        if (modalIsVisible()) {
+            const openId = currentFormQuestionId();
+            if (openId !== questionId) {
+                throw new Error("Restricted retry safety stop: expected Question ID " +
+                    questionId + ", but a different form is open (" + (openId || "unknown") + ").");
+            }
+            // Discard unsaved prompt/metadata changes from the first full attempt.
+            // Re-opening the record reloads its original prompt before the
+            // answer/rubric-only save, preventing the locked prompt being resubmitted.
+            await hideAddQuestionModal();
+            await sleep(300);
+        }
+        await openExistingQuestion(questionId);
+        if (currentFormQuestionId() !== questionId) {
+            throw new Error("Restricted retry could not re-open the correct Question ID " + questionId + ".");
+        }
     }
 
     async function openExistingQuestion(questionId) {
@@ -1036,34 +1471,624 @@
         }
     }
 
+    function normalizeMatchText(value) {
+        return String(value ?? "")
+            .normalize("NFKC")
+            .replace(/[–—]/g, "-")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLowerCase();
+    }
+
+    function getFormSelect(fieldKey) {
+        const selectors = {
+            module: ["#" + IDS.module, 'select[name$="$cmbSyllabusModule"]'],
+            topics: ["#" + IDS.topics, 'select[multiple][name$="$lstSyllabusTopic"]'],
+            difficulty: ["#" + IDS.difficulty, 'select[name$="$cmbQueLevel"]'],
+            courseOutcome: ["#" + IDS.courseOutcome, 'select[name$="$drpCO"]'],
+            bloomsTaxonomy: ["#" + IDS.bloomsTaxonomy, 'select[name$="$drpBloomsTaxonomy"]']
+        };
+        const modal = modalElement() || D;
+        for (const selector of (selectors[fieldKey] || [])) {
+            const element = modal.querySelector(selector);
+            if (element) return element;
+        }
+        return null;
+    }
+
+    function getUsableOptions(select) {
+        return Array.from(select?.options || []).filter(option =>
+            !option.disabled && option.value !== "" &&
+            !/^\s*(?:\(none\)|\(select\)|select)\s*$/i.test(option.textContent || "")
+        );
+    }
+
+    function choiceParts(choice) {
+        if (choice && typeof choice === "object" && !Array.isArray(choice)) {
+            return {
+                value: String(choice.value ?? choice.id ?? choice.code ?? choice.optionValue ?? "").trim(),
+                text: String(choice.text ?? choice.name ?? choice.label ?? choice.title ?? choice.code ?? "").trim(),
+                index: choice.index == null && choice.optionIndex == null
+                    ? null : Number(choice.index ?? choice.optionIndex)
+            };
+        }
+        const value = String(choice ?? "").trim();
+        return { value, text: value, index: null };
+    }
+
+    function resolveSingleOption(select, choice, fieldLabel) {
+        if (!select) {
+            throw new Error("DATA/PORTAL FIELD ERROR: The " + fieldLabel +
+                " control was not found in the current question form.");
+        }
+
+        const parts = choiceParts(choice);
+        const options = getUsableOptions(select);
+        if (parts.index != null && Number.isInteger(parts.index)) {
+            const index = parts.index >= 1 ? parts.index - 1 : parts.index;
+            if (options[index]) return options[index];
+        }
+
+        let match = options.find(option => option.value === parts.value && parts.value !== "");
+        if (match) return match;
+
+        for (const candidate of [parts.text, parts.value].filter(Boolean)) {
+            const normalized = normalizeMatchText(candidate);
+            match = options.find(option => normalizeMatchText(option.textContent) === normalized);
+            if (match) return match;
+        }
+
+        const bloomText = parts.text.replace(/[–—]/g, "-");
+        if (/^l\d+\s*-\s*/i.test(bloomText)) {
+            const stripped = bloomText.replace(/^l\d+\s*-\s*/i, "");
+            match = options.find(option =>
+                normalizeMatchText(option.textContent) === normalizeMatchText(stripped));
+            if (match) return match;
+        }
+
+        const coMatch = parts.text.match(/^CO\s*(\d+)$/i) || parts.value.match(/^CO\s*(\d+)$/i);
+        if (fieldLabel.toLowerCase().includes("course outcome") && coMatch) {
+            const coIndex = Number(coMatch[1]) - 1;
+            if (options[coIndex]) return options[coIndex];
+        }
+
+        throw new Error("DATA/PORTAL FIELD ERROR: Could not match " + fieldLabel +
+            " value \"" + (parts.text || parts.value) +
+            "\" to any option currently supplied by the portal. No approximate option was selected.");
+    }
+
+    function refreshChosen(select) {
+        if (!select || !W.jQuery) return;
+        try { W.jQuery(select).trigger("chosen:updated"); } catch (_) {}
+    }
+
+    function setSelectOption(select, option, description, triggerChange = true) {
+        if (!select || !option) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Cannot set " + description +
+                " because the control or matching option is missing.");
+        }
+        select.value = option.value;
+        if (triggerChange) {
+            select.dispatchEvent(new W.Event("input", { bubbles: true }));
+            select.dispatchEvent(new W.Event("change", { bubbles: true }));
+        }
+        refreshChosen(select);
+    }
+
+    async function setModuleFromJson(item) {
+        if (!item.moduleProvided) return;
+
+        const select = getFormSelect("module");
+        const option = resolveSingleOption(select, item.module, "Module");
+        const previousValue = select.value;
+
+        if (previousValue !== option.value) {
+            setStatus("Question ID " + item.questionId +
+                ": selecting module \"" + option.textContent.trim() +
+                "\" and waiting for its topic list...");
+            await runPartialPostback(() => {
+                const current = getFormSelect("module");
+                if (!current) {
+                    throw new Error("DATA/PORTAL FIELD ERROR: Module dropdown disappeared before selection.");
+                }
+                current.value = option.value;
+                current.dispatchEvent(new W.Event("change", { bubbles: true }));
+                refreshChosen(current);
+            }, "Changing module and loading its topics", RECOVERY.openFormTimeoutMs);
+
+            await waitFor(() => {
+                const currentModule = getFormSelect("module");
+                const currentTopics = getFormSelect("topics");
+                return currentModule && currentModule.value === option.value &&
+                    currentTopics && currentTopics.options.length > 0;
+            }, "module and topic options after module change", RECOVERY.openFormTimeoutMs);
+
+            if (currentFormQuestionId() !== item.questionId) {
+                throw new Error("DATA/PORTAL FIELD ERROR: Module selection changed the open form identity. Expected Question ID " +
+                    item.questionId + ", found " + (currentFormQuestionId() || "unknown") + ".");
+            }
+            await sleep(150);
+        } else {
+            refreshChosen(select);
+        }
+    }
+
+    function resolveTopicOptions(select, rawTopics, legacyString, questionId) {
+        const options = getUsableOptions(select);
+        const matchOne = raw => {
+            const parts = choiceParts(raw);
+            let option = options.find(candidate =>
+                parts.value !== "" && candidate.value === parts.value);
+            if (option) return option;
+            const text = parts.text || parts.value;
+            const normalized = normalizeMatchText(text);
+            return options.find(candidate =>
+                normalizeMatchText(candidate.textContent) === normalized) || null;
+        };
+
+        if (rawTopics == null || rawTopics === "") return [];
+        let requested;
+        if (Array.isArray(rawTopics)) {
+            requested = rawTopics;
+        } else {
+            const wholeMatch = matchOne(rawTopics);
+            if (wholeMatch) return [wholeMatch];
+
+            if (legacyString) {
+                // Greedy longest-option parsing preserves legacy topic labels
+                // that contain commas (for example, "A, B, C") while still
+                // recognizing several topics joined with comma separators.
+                let remaining = String(rawTopics).trim();
+                const parsed = [];
+                let parseFailed = false;
+
+                while (remaining) {
+                    const candidates = options.map(option => {
+                        const label = String(option.textContent || "").trim();
+                        const value = String(option.value || "").trim();
+                        const matched = [label, value].filter(Boolean)
+                            .filter(candidate => {
+                                const prefix = remaining.slice(0, candidate.length);
+                                const boundary = remaining.slice(candidate.length);
+                                return normalizeMatchText(prefix) === normalizeMatchText(candidate) &&
+                                    (boundary === "" || /^[;,]\s*/.test(boundary));
+                            })
+                            .sort((a, b) => b.length - a.length)[0];
+                        return matched ? { option, matchedLength: matched.length } : null;
+                    }).filter(Boolean).sort((a, b) => b.matchedLength - a.matchedLength);
+
+                    const chosen = candidates[0];
+                    if (!chosen) {
+                        parseFailed = true;
+                        break;
+                    }
+
+                    parsed.push(chosen.option);
+                    remaining = remaining.slice(chosen.matchedLength).replace(/^[;,]\s*/, "").trim();
+                }
+
+                requested = !parseFailed && parsed.length
+                    ? parsed
+                    : String(rawTopics).split(/[;,]/).map(value => value.trim()).filter(Boolean);
+            } else {
+                requested = [rawTopics];
+            }
+        }
+
+        const resolved = [];
+        const missing = [];
+        for (const topic of requested) {
+            const option = matchOne(topic);
+            if (option) {
+                if (!resolved.some(existing => existing.value === option.value)) resolved.push(option);
+            } else {
+                missing.push(typeof topic === "object" ? JSON.stringify(topic) : String(topic));
+            }
+        }
+
+        if (missing.length) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Question ID " + questionId +
+                " has topic value(s) not available under the selected module: " +
+                missing.join(" | ") +
+                ". Check the JSON module/topics pair. The script will not select a different topic.");
+        }
+        return resolved;
+    }
+
+    function setTopicsFromJson(item) {
+        if (!item.topicsProvided) return;
+
+        const select = getFormSelect("topics");
+        if (!select || !select.multiple) {
+            throw new Error("DATA/PORTAL FIELD ERROR: The Topics control was not found or is not a multi-select list.");
+        }
+
+        const resolved = resolveTopicOptions(
+            select, item.topics, item.topicsLegacyString, item.questionId
+        );
+        const wanted = new Set(resolved.map(option => option.value));
+
+        Array.from(select.options).forEach(option => {
+            option.selected = wanted.has(option.value);
+        });
+        select.dispatchEvent(new W.Event("input", { bubbles: true }));
+        select.dispatchEvent(new W.Event("change", { bubbles: true }));
+        refreshChosen(select);
+
+        const selectedValues = Array.from(select.selectedOptions).map(option => option.value);
+        if (selectedValues.length !== wanted.size ||
+            selectedValues.some(value => !wanted.has(value))) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Topics could not be selected exactly for Question ID " +
+                item.questionId + ".");
+        }
+    }
+
+    function setMarksFromJson(item) {
+        if (!item.marksProvided) return;
+
+        const group = byId(IDS.marks);
+        const scope = group || modalElement() || D;
+        const radios = Array.from(scope.querySelectorAll(
+            'input[type="radio"][name$="$drpQuestionMarks"], input[type="radio"]'
+        ));
+        const target = Number(item.marks);
+        const radio = radios.find(candidate => {
+            const label = candidate.id
+                ? D.querySelector('label[for="' + candidate.id.replace(/"/g, '\\"') + '"]')
+                : null;
+            const labelText = String(label?.textContent || "").trim();
+            const fromLabel = labelText.match(/\d+(?:\.\d+)?/);
+            const fromValue = String(candidate.value || "").match(/^\s*(\d+(?:\.\d+)?)/);
+            const numeric = fromLabel ? Number(fromLabel[0]) : (fromValue ? Number(fromValue[1]) : NaN);
+            return Number.isFinite(numeric) && Math.abs(numeric - target) < 0.000001;
+        });
+
+        if (!radio) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Marks option " + target +
+                " is not present in the current portal form. The script will not substitute another mark value.");
+        }
+        radio.click();
+        if (!radio.checked) radio.checked = true;
+        radio.dispatchEvent(new W.Event("change", { bubbles: true }));
+    }
+
+    function setSingleFieldFromJson(fieldKey, choice, fieldLabel) {
+        const select = getFormSelect(fieldKey);
+        const option = resolveSingleOption(select, choice, fieldLabel);
+        setSelectOption(select, option, fieldLabel, true);
+    }
+
+    // Difficulty is rendered by some portal versions as a segmented
+    // High / Medium / Low radio-button group rather than a normal <select>.
+    // Do not assume that the control is always a select. Resolve only an exact
+    // label/value match and wait briefly for asynchronous portal binding.
+    function findDifficultySelect(modal) {
+        const candidates = [];
+        const byId = modal.querySelector("#" + IDS.difficulty);
+        if (byId && byId.tagName === "SELECT") candidates.push(byId);
+        const byName = modal.querySelector('select[name$="$cmbQueLevel"]');
+        if (byName && !candidates.includes(byName)) candidates.push(byName);
+        const any = Array.from(modal.querySelectorAll("select")).find(select =>
+            String(select.id || "").toLowerCase().includes("cmbquelevel") ||
+            String(select.name || "").toLowerCase().includes("cmbquelevel")
+        );
+        if (any && !candidates.includes(any)) candidates.push(any);
+        return candidates[0] || null;
+    }
+
+    function exactVisibleText(element) {
+        if (!element) return "";
+        const value = element.getAttribute?.("aria-label") ||
+            element.getAttribute?.("title") ||
+            element.innerText || element.textContent || element.value || "";
+        return normalizeMatchText(value);
+    }
+
+    function findDifficultyGroup(modal, wantedText) {
+        const labelNodes = Array.from(modal.querySelectorAll(
+            "label, span, div, p, strong, b, small"
+        )).filter(element => isVisible(element) &&
+            normalizeMatchText(element.textContent) === "difficulty");
+
+        for (const label of labelNodes) {
+            let ancestor = label;
+            for (let depth = 0; ancestor && depth < 8; depth++, ancestor = ancestor.parentElement) {
+                const texts = new Set();
+                const nodes = ancestor.querySelectorAll(
+                    "button, label, [role='radio'], [role='button'], a, .btn, span, div, input[type='radio']"
+                );
+                for (const node of nodes) {
+                    if (!isVisible(node)) continue;
+                    const text = exactVisibleText(node);
+                    if (["high", "medium", "low"].includes(text)) texts.add(text);
+                }
+                if (texts.has(wantedText) && texts.size >= 2) return ancestor;
+            }
+        }
+        return null;
+    }
+
+    function clickDifficultyChoice(group, wantedText) {
+        if (!group) return false;
+
+        // Prefer a real radio input and its associated label when available.
+        for (const radio of Array.from(group.querySelectorAll('input[type="radio"]'))) {
+            let label = null;
+            if (radio.id) {
+                try { label = group.querySelector('label[for="' +
+                    radio.id.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"]'); }
+                catch (_) {}
+            }
+            if (!label) label = radio.closest("label");
+            const labelText = exactVisibleText(label);
+            const radioValue = normalizeMatchText(radio.value);
+            if (labelText === wantedText || radioValue === wantedText) {
+                if (label) label.click();
+                else radio.click();
+                radio.checked = true;
+                radio.dispatchEvent(new W.Event("input", { bubbles: true }));
+                radio.dispatchEvent(new W.Event("change", { bubbles: true }));
+                return true;
+            }
+        }
+
+        const interactive = Array.from(group.querySelectorAll(
+            "button, [role='radio'], [role='button'], label, a, .btn, [aria-pressed], [data-value]"
+        )).filter(element => isVisible(element) && exactVisibleText(element) === wantedText);
+        if (interactive.length) {
+            interactive[0].click();
+            return true;
+        }
+
+        // Some legacy markup attaches the click handler to a plain span/div.
+        const plain = Array.from(group.querySelectorAll("span, div"))
+            .filter(element => isVisible(element) && exactVisibleText(element) === wantedText)
+            .sort((a, b) => a.querySelectorAll("*").length - b.querySelectorAll("*").length);
+        if (plain.length) {
+            const target = plain[0].closest("[role='radio'], [role='button'], button, label, a") || plain[0];
+            target.click();
+            return true;
+        }
+        return false;
+    }
+
+    function difficultyDiagnostics(modal) {
+        const select = findDifficultySelect(modal);
+        const options = select ? Array.from(select.options || []).map(option =>
+            String(option.value) + ":" + String(option.textContent || "").trim()
+        ) : [];
+        const buttons = Array.from(modal.querySelectorAll(
+            "button, label, [role='radio'], [role='button'], .btn, input[type='radio']"
+        )).filter(isVisible).map(node => exactVisibleText(node)).filter(Boolean);
+        return "select=" + (select ? (select.id || select.name || "found") : "not found") +
+            "; options=[" + options.join(" | ") + "]" +
+            "; visible choice labels=[" + Array.from(new Set(buttons)).join(" | ") + "]";
+    }
+
+    async function setDifficultyFromJson(item) {
+        if (!item.difficultyProvided) return;
+        const parts = choiceParts(item.difficulty);
+        const wantedText = normalizeMatchText(parts.text || parts.value);
+        if (!wantedText) return;
+
+        const allowed = ["high", "medium", "low"];
+        if (!allowed.includes(wantedText)) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Unsupported Difficulty value \"" +
+                (parts.text || parts.value) + "\" for Question ID " + item.questionId +
+                ". Use High, Medium, or Low, or provide an exact portal option object.");
+        }
+
+        const deadline = Date.now() + 12000;
+        let lastDiagnostic = "";
+        while (Date.now() < deadline) {
+            const modal = modalElement() || D;
+            const select = findDifficultySelect(modal);
+            if (select) {
+                const options = getUsableOptions(select);
+                let option = options.find(candidate =>
+                    candidate.value === parts.value && !!parts.value
+                );
+                if (!option) {
+                    option = options.find(candidate =>
+                        normalizeMatchText(candidate.textContent) === wantedText
+                    );
+                }
+                if (option) {
+                    setSelectOption(select, option, "Difficulty", true);
+                    return;
+                }
+            }
+
+            const group = findDifficultyGroup(modal, wantedText);
+            if (group && clickDifficultyChoice(group, wantedText)) return;
+
+            lastDiagnostic = difficultyDiagnostics(modal);
+            await sleep(300);
+        }
+
+        throw new Error("DATA/PORTAL FIELD ERROR: Could not select Difficulty value \"" +
+            (parts.text || parts.value) + "\" for Question ID " + item.questionId +
+            " after waiting 12 seconds for the portal control. The script checked both a native dropdown and the visible High/Medium/Low choice group; it did not choose an approximate option. " +
+            "Portal diagnostics: " + lastDiagnostic);
+    }
+
+    function findOptionalField(fieldKey) {
+        const modal = modalElement() || D;
+        const patterns = {
+            questionType: /(question.?type|que.?type)/i,
+            alternateAnswers: /(alternate.?answers?|alternative.?answers?)/i
+        };
+        const pattern = patterns[fieldKey];
+        if (!pattern) return null;
+
+        const controls = Array.from(modal.querySelectorAll(
+            "select, textarea, input:not([type='hidden']), [contenteditable='true']"
+        ));
+        return controls.find(control =>
+            pattern.test(String(control.id || "")) ||
+            pattern.test(String(control.name || "")) ||
+            pattern.test(String(control.getAttribute("aria-label") || "")) ||
+            pattern.test(String(control.title || ""))
+        ) || null;
+    }
+
+    function noteUnsupportedField(item, fieldLabel) {
+        const state = readState() || {};
+        if (!Array.isArray(state.unsupportedFields)) state.unsupportedFields = [];
+        const entry = fieldLabel;
+        if (!state.unsupportedFields.includes(entry)) state.unsupportedFields.push(entry);
+        writeState(state);
+        console.info("[MU QB] JSON field retained but no separate editable portal control was found:", entry);
+    }
+
+    async function setOptionalFieldFromJson(item, fieldKey, fieldLabel, rawValue) {
+        if (rawValue == null) return;
+        const control = findOptionalField(fieldKey);
+        if (!control) {
+            noteUnsupportedField(item, fieldLabel);
+            return;
+        }
+
+        const value = Array.isArray(rawValue) ? rawValue.map(String).join("\n\n") : String(rawValue);
+        if (control.tagName === "SELECT") {
+            const option = resolveSingleOption(control, rawValue, fieldLabel);
+            setSelectOption(control, option, fieldLabel, true);
+        } else if (control.isContentEditable) {
+            control.innerHTML = value;
+            control.dispatchEvent(new W.Event("input", { bubbles: true }));
+            control.dispatchEvent(new W.Event("change", { bubbles: true }));
+        } else {
+            control.value = value;
+            control.dispatchEvent(new W.Event("input", { bubbles: true }));
+            control.dispatchEvent(new W.Event("change", { bubbles: true }));
+        }
+    }
+
+    async function applyQuestionMetadata(item) {
+        await setModuleFromJson(item);
+        if (isRestrictedQuestion(item)) return;
+
+        setTopicsFromJson(item);
+        if (isRestrictedQuestion(item)) return;
+
+        setMarksFromJson(item);
+        if (isRestrictedQuestion(item)) return;
+        if (item.difficultyProvided) {
+            await setDifficultyFromJson(item);
+        }
+        if (isRestrictedQuestion(item)) return;
+        if (item.courseOutcomeProvided) {
+            setSingleFieldFromJson("courseOutcome", item.courseOutcome, "Course Outcome");
+        }
+        if (isRestrictedQuestion(item)) return;
+        if (item.bloomsProvided) {
+            setSingleFieldFromJson("bloomsTaxonomy", item.bloomsTaxonomy, "Bloom's Taxonomy");
+        }
+        if (isRestrictedQuestion(item)) return;
+
+        if (item.questionTypeProvided) {
+            await setOptionalFieldFromJson(item, "questionType", "Question Type", item.questionType?.raw);
+        }
+        if (isRestrictedQuestion(item)) return;
+        if (item.alternateAnswersProvided) {
+            await setOptionalFieldFromJson(item, "alternateAnswers", "Alternate Answers", item.alternateAnswers);
+        }
+        if (isRestrictedQuestion(item)) return;
+        if (item.answerReferenceMediaProvided) {
+            noteUnsupportedField(item, "Answer Reference Media (browser file inputs cannot be populated from JSON)");
+        }
+    }
+
     function getRubricRows() {
         const table = byId(IDS.rubricTable);
         const tbody = table?.tBodies?.[0];
         return tbody ? Array.from(tbody.rows).filter(row => row.cells && row.cells.length >= 3) : [];
     }
 
-    async function ensureRubricRowCount(requiredCount, questionId) {
-        let count = getRubricRows().length;
-        if (count > requiredCount) {
-            throw new Error("Question ID " + questionId + " currently has " + count +
-                " rubric rows but the data file has " + requiredCount +
-                ". The script will not delete existing rubric rows automatically.");
-        }
+    function getRubricDeleteControl(row) {
+        if (!row || !row.cells || row.cells.length < 1) return null;
+        const actionCell = row.cells[row.cells.length - 1];
+        const controls = Array.from(actionCell.querySelectorAll(
+            "a, button, input[type='button'], input[type='submit'], input[type='image']"
+        )).filter(control => !control.disabled && isVisible(control));
+        if (!controls.length) return null;
 
+        const semantic = controls.filter(control => {
+            const signature = [
+                control.textContent, control.value, control.title,
+                control.getAttribute("aria-label"), control.className,
+                control.getAttribute("onclick"), control.getAttribute("href"),
+                control.querySelector("i")?.className
+            ].filter(Boolean).join(" ");
+            return /(remove|delete|trash|times|cross|close|clear|✖|×|✕|fa-trash|fa-times|glyphicon-remove)/i.test(signature);
+        });
+
+        if (semantic.length === 1) return semantic[0];
+        if (semantic.length > 1) return null;
+        return controls.length === 1 ? controls[0] : null;
+    }
+
+    async function clearExistingRubricRows(questionId) {
+        let guard = 0;
+        while (getRubricRows().length) {
+            const rows = getRubricRows();
+            const before = rows.length;
+            const removeControl = getRubricDeleteControl(rows[0]);
+            if (!removeControl) {
+                throw new Error("DATA/PORTAL FIELD ERROR: Question ID " + questionId +
+                    " has " + before + " existing rubric row(s), but the row's Action cell does not expose one unambiguous remove/delete control. Nothing was changed in the rubric section.");
+            }
+
+            setStatus("Question ID " + questionId + ": deleting existing rubric row " +
+                before + " of " + before + "...");
+            rubricDeleteInProgress = true;
+            try {
+                removeControl.click();
+            } finally {
+                rubricDeleteInProgress = false;
+            }
+
+            await waitFor(
+                () => getRubricRows().length < before,
+                "existing rubric row removal for Question ID " + questionId,
+                RECOVERY.postbackTimeoutMs
+            );
+            await sleep(150);
+
+            guard += 1;
+            if (guard > 100) {
+                throw new Error("DATA/PORTAL FIELD ERROR: Rubric cleanup exceeded 100 rows for Question ID " +
+                    questionId + ". The batch was paused for safety.");
+            }
+        }
+    }
+
+    async function ensureRubricRowCount(requiredCount, questionId) {
+        await clearExistingRubricRows(questionId);
+
+        let count = getRubricRows().length;
         while (count < requiredCount) {
             const before = count;
-            setStatus("Question ID " + questionId + ": adding rubric row " +
+            setStatus("Question ID " + questionId + ": adding new rubric row " +
                 (count + 1) + " of " + requiredCount + "...");
 
             await runPartialPostback(() => {
                 const button = byId(IDS.addRubric);
-                if (!button) throw new Error("Rubric Add Row button was not found.");
+                if (!button) {
+                    throw new Error("DATA/PORTAL FIELD ERROR: Rubric Add Row button was not found.");
+                }
                 button.click();
             }, "Adding rubric row");
 
             await waitFor(() => getRubricRows().length > before,
-                "new rubric row for Question ID " + questionId);
+                "new rubric row for Question ID " + questionId,
+                RECOVERY.postbackTimeoutMs);
             count = getRubricRows().length;
+        }
+
+        if (count !== requiredCount) {
+            throw new Error("DATA/PORTAL FIELD ERROR: Question ID " + questionId +
+                " expected exactly " + requiredCount + " new rubric rows, but found " + count + ".");
         }
     }
 
@@ -1148,7 +2173,9 @@
             D.querySelectorAll(selector).forEach(element => {
                 if (!isVisible(element)) return;
                 const message = String(element.textContent || "").replace(/\s+/g, " ").trim();
-                if (message && !messages.includes(message)) messages.push(message);
+                if (message && !isQuestionPaperLockedMessage(message) && !messages.includes(message)) {
+                    messages.push(message);
+                }
             });
         }
         return messages;
@@ -1157,11 +2184,16 @@
     async function waitForSuccessConfirmation(questionId) {
         await waitFor(() => {
             const state = readState();
-            return state && state.stage === "advance" && state.successPopupHandled === true;
-        }, "success popup and automatic OK click for Question ID " + questionId, RECOVERY.successTimeoutMs);
+            return state && (
+                (state.stage === "advance" && state.successPopupHandled === true) ||
+                (state.stage === "restricted_prepare" &&
+                    String(state.restrictedModeQuestionId || "") === String(questionId))
+            );
+        }, "success confirmation or question-paper restriction notice for Question ID " + questionId,
+        RECOVERY.successTimeoutMs);
     }
 
-    async function clickUpdateAndWait(item, index, total) {
+    async function clickUpdateAndWait(item, index, total, saveMode = "full") {
         const state = readState();
         if (!state?.running) throw new Error("Batch stopped before Update.");
 
@@ -1177,6 +2209,7 @@
 
         state.stage = "saving";
         state.currentQuestionId = item.questionId;
+        state.saveMode = saveMode;
         state.successPopupHandled = false;
         state.status = "Submitting Update for Question ID " + item.questionId + "...";
         writeState(state);
@@ -1209,11 +2242,21 @@
         if (!state.completedIds.includes(item.questionId)) {
             state.completedIds.push(item.questionId);
         }
+        if (String(state.restrictedModeQuestionId || "") === item.questionId ||
+            state.saveMode === "answers_rubrics") {
+            if (!Array.isArray(state.restrictedCompletedIds)) state.restrictedCompletedIds = [];
+            if (!state.restrictedCompletedIds.includes(item.questionId)) {
+                state.restrictedCompletedIds.push(item.questionId);
+            }
+        }
 
         state.index += 1;
         state.currentQuestionId = null;
+        state.restrictedModeQuestionId = null;
+        state.saveMode = null;
         state.successPopupHandled = false;
         state.successPopupAttempts = 0;
+        state.successPopupRecoveryRefreshCount = 0;
         popupClickAttempts = 0;
         popupClickBusy = false;
         state.retryQuestionId = null;
@@ -1257,7 +2300,11 @@
                         "\nSkipped (NOT modified): " + skippedCount +
                         "\nUpdated IDs: " + (state.completedIds || []).join(", ") +
                         "\nSkipped IDs: " + (state.skippedIds || []).join(", ") +
-                        (skippedReport.length ? "\nSKIPPED-QUESTION LOG:\n" + skippedReport.join("\n") : "\nNo skipped questions.");
+                        "\nUpdated in answer/rubric-only mode: " + (state.restrictedCompletedIds || []).join(", ") +
+                        (skippedReport.length ? "\nSKIPPED-QUESTION LOG:\n" + skippedReport.join("\n") : "\nNo skipped questions.") +
+                        ((state.unsupportedFields || []).length
+                            ? "\nPORTAL FIELDS NOT EXPOSED (kept in JSON, not submitted):\n" + state.unsupportedFields.join("\n")
+                            : "");
                     writeState(state);
                     setProgress(batch.length, batch.length);
                     setStatus(state.status);
@@ -1292,6 +2339,35 @@
                     continue;
                 }
 
+                if (state.stage === "restricted_prepare" || isRestrictedQuestion(item, state)) {
+                    setStatus("Question " + (state.index + 1) + "/" + batch.length +
+                        " — Question ID " + item.questionId +
+                        " is locked for prompt/metadata edits. Updating Expected Answer + Rubrics only...");
+
+                    await reopenExistingQuestionForRestrictedRetry(item.questionId);
+                    handleQuestionPaperLockNotice();
+                    if (currentFormQuestionId() !== item.questionId) {
+                        throw new Error("Restricted retry identity check failed for Question ID " + item.questionId + ".");
+                    }
+
+                    // This branch intentionally does NOT call applyQuestionMetadata()
+                    // and does NOT write Question Prompt or any other field.
+                    await ensureRubricRowCount(item.rubric.length, item.questionId);
+                    populateRubrics(item.rubric, item.questionId);
+                    await setEditorHtml(IDS.answerEditor, item.answer, "Expected Answer");
+
+                    if (currentFormQuestionId() !== item.questionId) {
+                        throw new Error("Restricted retry final identity check failed for Question ID " + item.questionId + ".");
+                    }
+                    const restrictedValidation = getVisibleValidationMessages();
+                    if (restrictedValidation.length) {
+                        throw new Error("Validation message before restricted Update: " + restrictedValidation.join(" | "));
+                    }
+
+                    await clickUpdateAndWait(item, state.index, batch.length, "answers_rubrics");
+                    continue;
+                }
+
                 if (state.stage !== "prepare") {
                     throw new Error("Unknown automation stage: " + state.stage);
                 }
@@ -1307,11 +2383,37 @@
                         item.questionId + ", found " + (currentFormQuestionId() || "unknown") + ".");
                 }
 
+                handleQuestionPaperLockNotice();
+                let latestState = readState();
+                if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
+                    continue;
+                }
+
+                await applyQuestionMetadata(item);
+                latestState = readState();
+                if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
+                    continue;
+                }
+
                 await ensureRubricRowCount(item.rubric.length, item.questionId);
+                latestState = readState();
+                if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
+                    continue;
+                }
                 populateRubrics(item.rubric, item.questionId);
 
                 await setEditorHtml(IDS.questionEditor, item.question, "Question Prompt");
+                latestState = readState();
+                if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
+                    continue;
+                }
                 await setEditorHtml(IDS.answerEditor, item.answer, "Expected Answer");
+
+                handleQuestionPaperLockNotice();
+                latestState = readState();
+                if (latestState?.stage === "restricted_prepare" || isRestrictedQuestion(item, latestState)) {
+                    continue;
+                }
 
                 if (currentFormQuestionId() !== item.questionId) {
                     throw new Error("Final identity check failed before saving Question ID " +
@@ -1404,7 +2506,7 @@
                 <button id="start">Start / Resume</button>
                 <button id="stop" disabled>Stop</button>
                 <button id="reset">Reset</button>
-                <button id="skip" hidden>Skip this ID and continue</button>
+                <button id="skip" hidden title="Leave the current failed question unchanged and continue to the next ID">Skip this ID and continue</button>
                 <button id="copyError" hidden>Copy error</button>
               </div>
             </div>
@@ -1515,40 +2617,59 @@
                 const batch = readBatch();
                 const state = readState();
                 if (!state || state.running || state.stage !== "error" ||
-                    !isMarksDropdownMismatch([state.status, state.lastError, state.lastPageAlert].filter(Boolean).join("\n"))) {
-                    throw new Error("Skip is available only when the batch is paused on the detected drpQuestionMarks SelectedValue configuration error.");
+                    !String(state.currentQuestionId || "").trim()) {
+                    throw new Error("Skip is available only when the batch is paused on an error for a specific Question ID.");
                 }
 
                 assertBatchMatchesState(state, batch);
                 const item = batch[state.index];
-                if (!item || String(state.currentQuestionId || item.questionId) !== item.questionId) {
+                if (!item || String(state.currentQuestionId) !== item.questionId) {
                     throw new Error("The current question ID does not match the saved batch position. Nothing was skipped.");
                 }
 
+                // Do not skip while an ASP.NET request is still changing the form.
+                await waitForPagePostbackIdle("portal request to finish before skipping Question ID " + item.questionId, true);
+
                 if (modalIsVisible()) {
                     if (isBlankAddQuestionForm()) {
-                        await closeBlankAddQuestionFormIfNeeded();
+                        await closeBlankAddQuestionFormIfNeeded(true);
                     } else {
-                        throw new Error("An edit form is still open. Close it manually before skipping this question.");
+                        const openId = currentFormQuestionId();
+                        if (openId !== item.questionId) {
+                            throw new Error("A different Question ID (" + (openId || "unknown") +
+                                ") is open. Close it manually; the script will not close another record.");
+                        }
+                        // The user has explicitly chosen to skip this failed record.
+                        // Hide its edit modal without clicking Update, discarding any
+                        // unsaved edits so the next record can be opened safely.
+                        await hideAddQuestionModal(true);
                     }
                 }
 
+                const diagnostic = String(state.lastError || state.status || "Unknown portal error");
                 const markText = item.marks == null ? "" : "\nQuestion marks: " + item.marks;
+                const restrictedText = String(state.restrictedModeQuestionId || "") === item.questionId
+                    ? "\nThe question-paper restriction was detected; the answer/rubric-only attempt also failed."
+                    : "";
                 const confirmed = W.confirm(
-                    "Skip Question ID " + item.questionId + "?" + markText +
-                    "\n\nThis question will NOT be updated and will be recorded separately as skipped. The batch will continue with the next ID."
+                    "Skip Question ID " + item.questionId + "?" + markText + restrictedText +
+                    "\n\nThis record will NOT be submitted again. It will be recorded as skipped, and the batch will continue with the next ID." +
+                    "\n\nLast error: " + diagnostic.slice(0, 700) +
+                    "\n\nIf the portal may have saved the record but failed to show confirmation, verify it manually later."
                 );
                 if (!confirmed) return;
 
                 addSkippedLogEntry(state, {
                     questionId: item.questionId,
                     marks: item.marks,
-                    reason: "Manually skipped by user",
+                    reason: "Manually skipped by user after paused error",
                     attempts: Number(state.retryCount || 0),
-                    error: String(state.lastError || state.status || "")
+                    error: [state.lastError, state.status, state.lastPageAlert].filter(Boolean).join("\n")
                 });
                 state.index += 1;
                 state.currentQuestionId = null;
+                state.restrictedModeQuestionId = null;
+                state.saveMode = null;
                 state.running = true;
                 state.stage = "prepare";
                 state.resumeStage = "prepare";
@@ -1559,7 +2680,8 @@
                 state.lastError = null;
                 state.successPopupHandled = false;
                 state.successPopupAttempts = 0;
-                state.status = "Skipped Question ID " + item.questionId + " (NOT updated). Continuing with the next question. Successfully updated: " +
+                state.status = "Skipped Question ID " + item.questionId +
+                    " (NOT resubmitted; recorded as skipped). Continuing with the next question. Successfully updated: " +
                     (state.completedIds || []).length + " | Skipped: " + state.skippedIds.length + ".";
                 writeState(state);
                 setPanelRunning(true);
@@ -1612,6 +2734,11 @@
                         completedIds: [],
                         skippedIds: [],
                         skippedLog: [],
+                        unsupportedFields: [],
+                        restrictedQuestionIds: [],
+                        restrictedCompletedIds: [],
+                        restrictedModeQuestionId: null,
+                        saveMode: null,
                         currentQuestionId: null,
                         successPopupHandled: false,
                         successPopupAttempts: 0,
@@ -1626,6 +2753,9 @@
                     assertBatchMatchesState(state, batch);
                     if (!Array.isArray(state.skippedIds)) state.skippedIds = [];
                     if (!Array.isArray(state.skippedLog)) state.skippedLog = [];
+                    if (!Array.isArray(state.unsupportedFields)) state.unsupportedFields = [];
+                    if (!Array.isArray(state.restrictedQuestionIds)) state.restrictedQuestionIds = [];
+                    if (!Array.isArray(state.restrictedCompletedIds)) state.restrictedCompletedIds = [];
                     state.running = true;
                     if (state.stage === "error") state.stage = state.resumeStage || "prepare";
                     state.retryCount = 0;
@@ -1670,6 +2800,11 @@
                 state.completedIds = [];
                 state.skippedIds = [];
                 state.skippedLog = [];
+                state.unsupportedFields = [];
+                state.restrictedQuestionIds = [];
+                state.restrictedCompletedIds = [];
+                state.restrictedModeQuestionId = null;
+                state.saveMode = null;
                 state.currentQuestionId = null;
                 state.successPopupHandled = false;
                 state.successPopupAttempts = 0;
@@ -1742,12 +2877,16 @@
                 // the success popup may have been lost. Re-open and re-apply the same
                 // existing record instead of waiting forever for a vanished popup.
                 if (state.stage === "saving") {
-                    state.stage = "prepare";
-                    state.resumeStage = "prepare";
+                    const restrictedPending = String(state.restrictedModeQuestionId || "") ===
+                        String(state.currentQuestionId || "");
+                    state.stage = restrictedPending ? "restricted_prepare" : "prepare";
+                    state.resumeStage = state.stage;
                     state.successPopupHandled = false;
                     state.status = "Recovering interrupted save for Question ID " +
                         (state.currentQuestionId || "current record") +
-                        "; the same record will be safely re-applied.";
+                        (restrictedPending
+                            ? "; resuming in answer/rubric-only mode."
+                            : "; the same record will be safely re-applied.");
                     writeState(state);
                 }
 
@@ -1776,5 +2915,5 @@
         onReady();
     }
 
-    console.info("[MU QB] Version 7.3 loaded (mark-aware validation; bounded recovery; explicit skip for permanent marks-dropdown configuration errors; skipped IDs are tracked separately).");
+    console.info("[MU QB] Version 8.4.0 loaded (JSON-driven metadata; multi-topic; replace-all rubrics; persistent question-paper banner ignored during answer/rubric-only save; genuine server alerts retained; server-response-only recovery).");
 })();
