@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Marwadi University Question Bank — Auto Resume Updater
 // @namespace    MU-QuestionBank-Automation
-// @version      8.4.2
+// @version      8.4.3
 // @description  JSON-driven updater; appends alternate acceptable answers to the same Expected Answer CKEditor field; retains auto-resume, rubric and popup recovery.
 // @match        https://academic.marwadiuniversity.ac.in:553/ManageQuestionBank.aspx*
 // @run-at       document-start
@@ -2119,6 +2119,179 @@
     // Build the complete Expected Answer for the portal's single CKEditor field.
     // The university form has no separate Alternate Answers control, so all
     // alternate acceptable answers are appended to the main answer here.
+    // HTML in alternateAnswers is parsed as markup (not escaped as visible text),
+    // sanitized to a formatting allow-list, and then passed to CKEditor as HTML.
+    const ANSWER_HTML_ALLOWED_TAGS = new Set([
+        "A", "B", "STRONG", "I", "EM", "U", "S", "STRIKE", "DEL", "INS",
+        "P", "DIV", "SPAN", "BR", "HR", "WBR", "CENTER", "H1", "H2", "H3", "H4", "H5", "H6",
+        "UL", "OL", "LI", "DL", "DT", "DD", "TABLE", "CAPTION", "COLGROUP",
+        "COL", "THEAD", "TBODY", "TFOOT", "TR", "TD", "TH", "BLOCKQUOTE",
+        "PRE", "CODE", "SUB", "SUP", "SMALL", "BIG", "MARK", "ABBR", "CITE",
+        "Q", "KBD", "SAMP", "VAR", "ADDRESS", "FIGURE", "FIGCAPTION", "FONT"
+    ]);
+
+    const ANSWER_HTML_DROP_TAGS = new Set([
+        "SCRIPT", "STYLE", "IFRAME", "FRAME", "FRAMESET", "OBJECT", "EMBED",
+        "APPLET", "FORM", "INPUT", "BUTTON", "TEXTAREA", "SELECT", "OPTION",
+        "LINK", "META", "BASE", "SVG", "MATH", "VIDEO", "AUDIO", "SOURCE",
+        "CANVAS", "TEMPLATE"
+    ]);
+
+    const ANSWER_HTML_VOID_TAGS = new Set(["BR", "HR", "WBR", "COL"]);
+
+    function escapeAnswerHtml(value) {
+        return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;")
+            .replace(/'/g, "&#39;");
+    }
+
+    function decodeEncodedAnswerMarkup(value) {
+        const text = String(value ?? "");
+        // Also support data generators that have already entity-encoded tags,
+        // e.g. "&lt;p&gt;Answer&lt;/p&gt;". Ordinary entities such as "&lt; 5"
+        // are left untouched unless they clearly encode a known HTML tag.
+        const knownTag = "(?:p|div|span|br|hr|strong|b|em|i|u|h[1-6]|ul|ol|li|table|thead|tbody|tr|td|th|blockquote|pre|code)";
+        if (!new RegExp("&lt;\\/?" + knownTag + "\\b", "i").test(text) || !/&gt;/i.test(text)) {
+            return text;
+        }
+        const decoder = D.createElement("textarea");
+        decoder.innerHTML = text;
+        return decoder.value;
+    }
+
+    function safeAnswerInlineStyle(styleText) {
+        const probe = D.createElement("span");
+        probe.setAttribute("style", String(styleText || ""));
+        const allowedProperties = [
+            "text-align", "font-weight", "font-style", "text-decoration",
+            "vertical-align", "white-space", "color", "background-color",
+            "border", "border-collapse", "padding", "margin", "width", "height"
+        ];
+        const safe = [];
+        for (const property of allowedProperties) {
+            const value = probe.style.getPropertyValue(property).trim();
+            if (!value) continue;
+            // Only simple CSS values are retained; URL/expression-based values
+            // and other executable or externally-loaded CSS are rejected.
+            if (!/^[a-z0-9#(),.%\s-]+$/i.test(value) || /url|expression|javascript|var\s*\(/i.test(value)) {
+                continue;
+            }
+            safe.push(property + ":" + value);
+        }
+        return safe.length ? ' style="' + escapeAnswerHtml(safe.join(";")) + '"' : "";
+    }
+
+    function sanitizeAlternateAnswerHtml(rawValue) {
+        const source = decodeEncodedAnswerMarkup(String(rawValue ?? "").trim());
+        if (!source) return "";
+
+        // Plain text remains fully supported. It is escaped and converted into
+        // paragraphs/line breaks, while actual HTML fragments retain formatting.
+        if (!/<\/?[a-z][a-z0-9:-]*(?:\s[^<>]*?)?\s*\/?\s*>/i.test(source)) {
+            return source
+                .replace(/\r\n?/g, "\n")
+                .split(/\n{2,}/)
+                .map(paragraph => paragraph.trim())
+                .filter(Boolean)
+                .map(paragraph => "<p>" + escapeAnswerHtml(paragraph).replace(/\n/g, "<br>") + "</p>")
+                .join("\n");
+        }
+
+        const template = D.createElement("template");
+        template.innerHTML = source;
+
+        function sanitizeNode(node) {
+            if (node.nodeType === 3) return escapeAnswerHtml(node.nodeValue || "");
+            if (node.nodeType !== 1) return "";
+
+            const tag = String(node.tagName || "").toUpperCase();
+            if (ANSWER_HTML_DROP_TAGS.has(tag)) return "";
+
+            const children = Array.from(node.childNodes).map(sanitizeNode).join("");
+            // Unknown/non-semantic wrappers are unwrapped, preserving their
+            // readable contents without passing unsupported markup to CKEditor.
+            if (!ANSWER_HTML_ALLOWED_TAGS.has(tag)) return children;
+
+            let attributes = "";
+            const title = node.getAttribute("title");
+            if (title) attributes += ' title="' + escapeAnswerHtml(title) + '"';
+
+            if (tag === "A") {
+                const href = (node.getAttribute("href") || "").trim();
+                if (href) {
+                    try {
+                        const parsed = new W.URL(href, W.location.href);
+                        if (["http:", "https:", "mailto:"].includes(parsed.protocol) || href.startsWith("#")) {
+                            attributes += ' href="' + escapeAnswerHtml(href) + '"';
+                            if (/^https?:/i.test(parsed.protocol)) {
+                                attributes += ' target="_blank" rel="noopener noreferrer"';
+                            }
+                        }
+                    } catch (_) { /* Invalid links are omitted. */ }
+                }
+            }
+
+            if (tag === "TD" || tag === "TH") {
+                for (const attr of ["colspan", "rowspan"]) {
+                    const value = node.getAttribute(attr);
+                    if (value && /^\d{1,2}$/.test(value)) attributes += " " + attr + '=\"' + value + '\"';
+                }
+                const align = (node.getAttribute("align") || "").toLowerCase();
+                if (["left", "center", "right", "justify"].includes(align)) {
+                    attributes += ' align="' + align + '"';
+                }
+                if (tag === "TH") {
+                    const scope = (node.getAttribute("scope") || "").toLowerCase();
+                    if (["row", "col", "rowgroup", "colgroup"].includes(scope)) {
+                        attributes += ' scope="' + scope + '"';
+                    }
+                }
+            }
+
+            if (tag === "TABLE") {
+                for (const attr of ["border", "cellpadding", "cellspacing"]) {
+                    const value = node.getAttribute(attr);
+                    if (value && /^\d{1,3}$/.test(value)) attributes += ' ' + attr + '=\"' + value + '\"';
+                }
+                const width = (node.getAttribute("width") || "").trim();
+                if (/^\d{1,4}(?:%|px)?$/.test(width)) attributes += ' width="' + width + '"';
+            }
+            if (tag === "COL") {
+                const span = node.getAttribute("span");
+                if (span && /^\d{1,2}$/.test(span)) attributes += ' span="' + span + '"';
+            }
+            if (tag === "FONT") {
+                const color = (node.getAttribute("color") || "").trim();
+                if (/^(?:#[0-9a-f]{3,8}|[a-z]{3,20})$/i.test(color)) attributes += ' color="' + color + '"';
+                const size = (node.getAttribute("size") || "").trim();
+                if (/^[1-7]$/.test(size)) attributes += ' size="' + size + '"';
+            }
+
+            if (tag === "OL") {
+                const start = node.getAttribute("start");
+                if (start && /^-?\d{1,4}$/.test(start)) attributes += ' start="' + start + '"';
+                const type = (node.getAttribute("type") || "").trim();
+                if (["1", "a", "A", "i", "I"].includes(type)) attributes += ' type="' + type + '"';
+            }
+            if (tag === "LI") {
+                const value = node.getAttribute("value");
+                if (value && /^-?\d{1,4}$/.test(value)) attributes += ' value="' + value + '"';
+            }
+
+            const style = safeAnswerInlineStyle(node.getAttribute("style"));
+            if (style) attributes += style;
+
+            const name = tag.toLowerCase();
+            if (ANSWER_HTML_VOID_TAGS.has(tag)) return "<" + name + attributes + ">";
+            return "<" + name + attributes + ">" + children + "</" + name + ">";
+        }
+
+        return Array.from(template.content.childNodes).map(sanitizeNode).join("\n").trim();
+    }
+
     function buildExpectedAnswerHtml(item) {
         const mainAnswer = String(item.answer ?? "");
         const rawAlternatives = Array.isArray(item.alternateAnswers)
@@ -2126,24 +2299,14 @@
             : (item.alternateAnswers == null ? [] : [item.alternateAnswers]);
 
         const alternatives = rawAlternatives
-            .map(value => String(value ?? "").trim())
+            .map(value => sanitizeAlternateAnswerHtml(value))
             .filter(Boolean);
 
         if (!alternatives.length) return mainAnswer;
 
-        // Alternate answers are treated as plain text and HTML-escaped so
-        // special characters cannot break the CKEditor document structure.
-        const escapeHtml = value => String(value)
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#39;");
-
-        const alternateItems = alternatives.map(value => {
-            const safeText = escapeHtml(value).replace(/\r\n|\r|\n/g, "<br>");
-            return "<li>" + safeText + "</li>";
-        }).join("\n");
+        const alternateItems = alternatives.map(value =>
+            "<li><div>" + value + "</div></li>"
+        ).join("\n");
 
         return mainAnswer +
             "\n<hr>\n" +
@@ -2946,5 +3109,5 @@
         onReady();
     }
 
-    console.info("[MU QB] Version 8.4.2 loaded (alternate acceptable answers appended in the same Expected Answer CKEditor; JSON-driven metadata; multi-topic; replace-all rubrics; question-paper answer/rubric-only mode; automatic success-popup recovery).");
+    console.info("[MU QB] Version 8.4.3 loaded (HTML-aware alternate answers appended in the same Expected Answer CKEditor; sanitized formatting; JSON-driven metadata; multi-topic; replace-all rubrics; question-paper answer/rubric-only mode; automatic success-popup recovery).");
 })();
